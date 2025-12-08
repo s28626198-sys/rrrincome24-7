@@ -1563,6 +1563,10 @@ flask_app = Flask(__name__)
 webhook_initialized = False
 _initialization_lock = threading.Lock()
 
+# Persistent event loop for webhook processing (runs in background thread)
+_webhook_loop = None
+_webhook_loop_thread = None
+
 def initialize_webhook_once():
     """Initialize webhook once on startup"""
     global application, webhook_initialized
@@ -1592,7 +1596,7 @@ def initialize_webhook_once():
                             allowed_updates=Update.ALL_TYPES,
                             drop_pending_updates=True
                         )
-                        # Start the application to process updates from queue
+                        # Start the application to process updates
                         await application.start()
                         logger.info(f"✅ Webhook set successfully: {webhook_url}/webhook")
                     except Exception as e:
@@ -1601,22 +1605,15 @@ def initialize_webhook_once():
                         logger.error(traceback.format_exc())
                         raise
                 
-                # Create new event loop for webhook setup (persistent)
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_closed():
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                # Use the persistent webhook loop for initialization
+                global _webhook_loop
+                if _webhook_loop is None or _webhook_loop.is_closed():
+                    start_webhook_loop()
+                    time.sleep(0.5)  # Wait for loop to be ready
                 
-                if loop.is_running():
-                    # If loop is running, schedule it
-                    future = asyncio.run_coroutine_threadsafe(set_webhook_async(), loop)
-                    future.result(timeout=30)
-                else:
-                    loop.run_until_complete(set_webhook_async())
+                # Schedule webhook setup in background loop
+                future = asyncio.run_coroutine_threadsafe(set_webhook_async(), _webhook_loop)
+                future.result(timeout=30)
                 
                 webhook_initialized = True
                 logger.info("✅ Webhook initialization completed")
@@ -1633,8 +1630,29 @@ def before_request():
     if not webhook_initialized:
         initialize_webhook_once()
 
+# Start persistent event loop in background thread for webhook processing
+def start_webhook_loop():
+    """Start persistent event loop in background thread"""
+    global _webhook_loop, _webhook_loop_thread
+    
+    if _webhook_loop_thread and _webhook_loop_thread.is_alive():
+        return
+    
+    def run_loop():
+        global _webhook_loop
+        _webhook_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_webhook_loop)
+        _webhook_loop.run_forever()
+    
+    _webhook_loop_thread = threading.Thread(target=run_loop, daemon=True)
+    _webhook_loop_thread.start()
+    logger.info("Background event loop thread started for webhook processing")
+
 # Also initialize on app startup (when gunicorn loads the module)
 if os.getenv("USE_WEBHOOK", "false").lower() == "true":
+    # Start persistent event loop first
+    start_webhook_loop()
+    
     # Use threading to initialize in background to not block
     def init_in_background():
         time.sleep(2)  # Wait a bit for Flask to be ready
