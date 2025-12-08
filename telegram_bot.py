@@ -11,6 +11,7 @@ import logging
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
+from flask import Flask, request
 
 # Try to import cloudscraper for Cloudflare bypass
 try:
@@ -1474,8 +1475,21 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         import traceback
         logger.error(traceback.format_exc())
 
-def main():
-    """Start the bot"""
+# Global application instance
+application = None
+
+def create_app():
+    """Create and configure the Telegram bot application"""
+    global application
+    
+    # Initialize database on startup
+    try:
+        init_database()
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}")
+        logger.warning("Bot will continue but database operations may fail")
+    
     # Initialize global API client (login will retry on first API call if needed)
     logger.info("Initializing global API client...")
     api_client = get_global_api_client()
@@ -1493,10 +1507,62 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start bot
-    logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    return application
+
+def main():
+    """Start the bot in polling mode (for local development)"""
+    app = create_app()
+    logger.info("Bot starting in polling mode...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# Flask app for webhook
+flask_app = Flask(__name__)
+
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming webhook updates"""
+    if application is None:
+        create_app()
+    
+    update = Update.de_json(request.json, application.bot)
+    application.process_update(update)
+    return 'OK', 200
+
+@flask_app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return {'status': 'ok'}, 200
+
+def run_webhook():
+    """Start the bot in webhook mode (for production)"""
+    global application
+    
+    # Get webhook URL from environment
+    webhook_url = os.getenv("WEBHOOK_URL", "")
+    port = int(os.getenv("PORT", 5000))
+    
+    if not webhook_url:
+        logger.error("WEBHOOK_URL environment variable not set!")
+        logger.info("Falling back to polling mode...")
+        main()
+        return
+    
+    # Create application
+    app = create_app()
+    
+    # Set webhook
+    logger.info(f"Setting webhook to: {webhook_url}/webhook")
+    app.bot.set_webhook(url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES)
+    logger.info("✅ Webhook set successfully")
+    
+    # Start Flask server
+    logger.info(f"Starting Flask server on port {port}...")
+    flask_app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == "__main__":
-    main()
+    # Check if running in production (webhook mode) or development (polling mode)
+    if os.getenv("USE_WEBHOOK", "false").lower() == "true":
+        run_webhook()
+    else:
+        main()
 
