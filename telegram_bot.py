@@ -72,35 +72,52 @@ def init_database():
     if db_pool is not None:
         return  # Already initialized
     try:
-        # Force IPv4 connection to avoid IPv6 issues
+        # Try using Supabase pooler connection (pooler.supabase.com) which supports both IPv4 and IPv6
+        # Extract project ref from host or use pooler endpoint
+        pooler_host = SUPABASE_DB_HOST.replace("db.", "pooler.")
+        
+        # If that doesn't work, try using IPv4 directly via connection string options
         import socket
         
-        # Get IPv4 address explicitly
-        host_ip = None
-        try:
-            # Get all address info and filter for IPv4
-            addr_info = socket.getaddrinfo(SUPABASE_DB_HOST, SUPABASE_DB_PORT, 
-                                         family=socket.AF_INET, 
-                                         type=socket.SOCK_STREAM)
-            if addr_info:
-                host_ip = addr_info[0][4][0]
-                logger.info(f"Resolved {SUPABASE_DB_HOST} to IPv4: {host_ip}")
-        except (socket.gaierror, OSError) as e:
-            logger.warning(f"Could not resolve IPv4 for {SUPABASE_DB_HOST}: {e}")
-            # Fallback: try direct hostname but force IPv4 in connection string
-            host_ip = SUPABASE_DB_HOST
+        # Try multiple connection methods
+        connection_methods = [
+            # Method 1: Try pooler endpoint (better for connection pooling)
+            {
+                'host': pooler_host,
+                'port': SUPABASE_DB_PORT,
+                'database': SUPABASE_DB_NAME,
+                'user': SUPABASE_DB_USER,
+                'password': SUPABASE_DB_PASSWORD,
+                'connect_timeout': 10,
+                'options': '-c ip_family=ipv4'
+            },
+            # Method 2: Try original host with IPv4 forcing
+            {
+                'host': SUPABASE_DB_HOST,
+                'port': SUPABASE_DB_PORT,
+                'database': SUPABASE_DB_NAME,
+                'user': SUPABASE_DB_USER,
+                'password': SUPABASE_DB_PASSWORD,
+                'connect_timeout': 10,
+                'options': '-c ip_family=ipv4'
+            }
+        ]
         
-        # Use connection string with IPv4 forcing
-        db_pool = psycopg2.pool.ThreadedConnectionPool(
-            1, 20,
-            host=host_ip,
-            port=SUPABASE_DB_PORT,
-            database=SUPABASE_DB_NAME,
-            user=SUPABASE_DB_USER,
-            password=SUPABASE_DB_PASSWORD,
-            connect_timeout=10
-        )
-        logger.info("Database connection pool created successfully")
+        last_error = None
+        for method_idx, conn_params in enumerate(connection_methods):
+            try:
+                logger.info(f"Trying database connection method {method_idx + 1}: {conn_params['host']}")
+                db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **conn_params)
+                logger.info(f"✅ Database connection pool created successfully using {conn_params['host']}")
+                return  # Success!
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Connection method {method_idx + 1} failed: {e}")
+                continue
+        
+        # If all methods failed, raise the last error
+        raise last_error
+        
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         import traceback
