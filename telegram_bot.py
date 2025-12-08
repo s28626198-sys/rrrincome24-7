@@ -1530,6 +1530,17 @@ def health_check():
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming Telegram updates via webhook"""
+    global application
+    
+    # Ensure application is initialized
+    if application is None:
+        logger.warning("Application not initialized, initializing now...")
+        try:
+            init_application_if_needed()
+        except Exception as e:
+            logger.error(f"Failed to initialize application: {e}")
+            return Response('Internal Server Error', status=500)
+    
     if request.method == 'POST':
         try:
             json_data = request.get_json(force=True)
@@ -1544,6 +1555,56 @@ def webhook():
             traceback.print_exc()
         return Response('OK', status=200)
     return Response('Method not allowed', status=405)
+
+def init_application_if_needed():
+    """Initialize application if not already initialized (for gunicorn)"""
+    global application
+    
+    if application is not None:
+        return
+    
+    logger.info("Initializing application...")
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("users", admin_commands))
+    application.add_handler(CommandHandler("remove", admin_commands))
+    application.add_handler(CommandHandler("pending", admin_commands))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Initialize database
+    try:
+        init_database()
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}")
+        logger.warning("Bot will continue but database operations may fail")
+    
+    # Initialize global API client
+    logger.info("Initializing global API client...")
+    api_client = get_global_api_client()
+    if api_client:
+        logger.info("✅ API client initialized")
+    
+    # Initialize application for webhook mode
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        render_url = os.environ.get('WEBHOOK_URL', '')
+    
+    if render_url:
+        # Setup webhook
+        if setup_webhook():
+            # Initialize the application
+            loop = get_or_create_event_loop()
+            loop.run_until_complete(application.initialize())
+            loop.run_until_complete(application.start())
+            logger.info("✅ Application initialized and started for webhook mode")
+        else:
+            logger.warning("Failed to setup webhook, application may not work correctly")
 
 def setup_webhook():
     """Setup webhook for Telegram bot"""
@@ -1677,6 +1738,16 @@ def run_polling_mode():
                 application.stop()
             except:
                 pass
+
+# Initialize application when module is imported (for gunicorn)
+if os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('WEBHOOK_URL'):
+    # Running in webhook mode - initialize when module loads
+    try:
+        init_application_if_needed()
+    except Exception as e:
+        logger.error(f"Failed to initialize application on import: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
