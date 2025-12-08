@@ -1508,7 +1508,15 @@ def create_app():
         logger.info("✅ API client initialized (login will retry on first API call if needed)")
     
     # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Use standard builder - it will work for both polling and webhook
+    try:
+        application = Application.builder().token(BOT_TOKEN).build()
+        logger.info("✅ Telegram Application created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create Application: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
