@@ -1494,9 +1494,16 @@ def webhook():
             json_data = request.get_json(force=True)
             update = Update.de_json(json_data, application.bot)
             
-            # Use persistent event loop
+            # Get the event loop - use the one from background thread if available
             loop = get_or_create_event_loop()
-            loop.run_until_complete(application.process_update(update))
+            
+            # Check if loop is already running
+            if loop.is_running():
+                # Schedule as a task in the running loop
+                asyncio.create_task(application.process_update(update))
+            else:
+                # Loop not running, use run_until_complete
+                loop.run_until_complete(application.process_update(update))
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             import traceback
