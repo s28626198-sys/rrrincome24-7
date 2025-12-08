@@ -25,15 +25,7 @@ services:
         sync: false
       - key: SUPABASE_URL
         sync: false
-      - key: SUPABASE_DB_HOST
-        sync: false
-      - key: SUPABASE_DB_PORT
-        sync: false
-      - key: SUPABASE_DB_NAME
-        sync: false
-      - key: SUPABASE_DB_USER
-        sync: false
-      - key: SUPABASE_DB_PASSWORD
+      - key: SUPABASE_KEY
         sync: false
       - key: WEBHOOK_URL
         fromService:

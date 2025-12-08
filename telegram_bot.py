@@ -11,9 +11,7 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import logging
-import psycopg2
-from psycopg2 import pool
-from psycopg2.extras import RealDictCursor
+from supabase import create_client, Client
 from flask import Flask, request, Response
 
 # Try to import cloudscraper for Cloudflare bypass
@@ -53,73 +51,21 @@ BASE_URL = "https://v2.mnitnetwork.com"
 API_EMAIL = "roni791158@gmail.com"
 API_PASSWORD = "47611858@Dove"
 
-# Supabase Database Configuration
+# Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://sgnnqvfoajqsfdyulolm.supabase.co")
-SUPABASE_DB_HOST = os.getenv("SUPABASE_DB_HOST", "db.sgnnqvfoajqsfdyulolm.supabase.co")
-SUPABASE_DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432")
-SUPABASE_DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres")
-SUPABASE_DB_USER = os.getenv("SUPABASE_DB_USER", "postgres.sgnnqvfoajqsfdyulolm")
-SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "53561106Tojo")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNnbm5xdmZvYWpxc2ZkeXVsb2xtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQxNzE1MjcsImV4cCI6MjA3OTc0NzUyN30.dFniV0odaT-7bjs5iQVFQ-N23oqTGMAgQKjswhaHSP4")
 
-db_lock = threading.Lock()
-
-# Database connection pool
-db_pool = None
+# ==================== SUPABASE CLIENT ====================
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def init_database():
-    """Initialize Supabase PostgreSQL database connection pool"""
-    global db_pool
-    if db_pool is not None:
-        return  # Already initialized
+    """Initialize Supabase client (already done above, this is for compatibility)"""
     try:
-        # Try using Supabase pooler connection (pooler.supabase.com) which supports both IPv4 and IPv6
-        # Extract project ref from host or use pooler endpoint
-        pooler_host = SUPABASE_DB_HOST.replace("db.", "pooler.")
-        
-        # If that doesn't work, try using IPv4 directly via connection string options
-        import socket
-        
-        # Try multiple connection methods
-        connection_methods = [
-            # Method 1: Try pooler endpoint (better for connection pooling)
-            {
-                'host': pooler_host,
-                'port': SUPABASE_DB_PORT,
-                'database': SUPABASE_DB_NAME,
-                'user': SUPABASE_DB_USER,
-                'password': SUPABASE_DB_PASSWORD,
-                'connect_timeout': 10,
-                'options': '-c ip_family=ipv4'
-            },
-            # Method 2: Try original host with IPv4 forcing
-            {
-                'host': SUPABASE_DB_HOST,
-                'port': SUPABASE_DB_PORT,
-                'database': SUPABASE_DB_NAME,
-                'user': SUPABASE_DB_USER,
-                'password': SUPABASE_DB_PASSWORD,
-                'connect_timeout': 10,
-                'options': '-c ip_family=ipv4'
-            }
-        ]
-        
-        last_error = None
-        for method_idx, conn_params in enumerate(connection_methods):
-            try:
-                logger.info(f"Trying database connection method {method_idx + 1}: {conn_params['host']}")
-                db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, **conn_params)
-                logger.info(f"✅ Database connection pool created successfully using {conn_params['host']}")
-                return  # Success!
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Connection method {method_idx + 1} failed: {e}")
-                continue
-        
-        # If all methods failed, raise the last error
-        raise last_error
-        
+        # Test connection
+        supabase.table('users').select('user_id').limit(1).execute()
+        logger.info("✅ Supabase client initialized successfully")
     except Exception as e:
-        logger.error(f"Error initializing database: {e}")
+        logger.error(f"Error testing Supabase connection: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise
@@ -154,168 +100,119 @@ def refresh_global_token():
         else:
             get_global_api_client()
 
-def get_db_connection():
-    """Get database connection from pool"""
-    if db_pool is None:
-        init_database()
-    return db_pool.getconn()
-
 def get_user_status(user_id):
     """Get user approval status from database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT status FROM users WHERE user_id = %s', (user_id,))
-            result = cursor.fetchone()
-            if result:
-                return result[0]
-            return None
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        result = supabase.table('users').select('status').eq('user_id', user_id).execute()
+        if result.data and len(result.data) > 0:
+            return result.data[0]['status']
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_user_status: {e}")
+        return None
 
 def add_user(user_id, username):
     """Add new user to database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO users (user_id, username, status)
-                VALUES (%s, %s, 'pending')
-                ON CONFLICT (user_id) DO NOTHING
-            ''', (user_id, username))
-            conn.commit()
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        # Check if user exists first
+        existing = supabase.table('users').select('user_id').eq('user_id', user_id).execute()
+        if not existing.data:
+            new_user = {
+                'user_id': user_id,
+                'username': username,
+                'status': 'pending'
+            }
+            supabase.table('users').insert(new_user).execute()
+    except Exception as e:
+        logger.error(f"Error in add_user: {e}")
 
 def approve_user(user_id):
     """Approve user in database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE users SET status = 'approved', approved_at = CURRENT_TIMESTAMP
-                WHERE user_id = %s
-            ''', (user_id,))
-            conn.commit()
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        update_data = {
+            'status': 'approved',
+            'approved_at': datetime.now().isoformat()
+        }
+        supabase.table('users').update(update_data).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error in approve_user: {e}")
 
 def reject_user(user_id):
     """Reject user in database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('UPDATE users SET status = %s WHERE user_id = %s', ('rejected', user_id))
-            conn.commit()
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        supabase.table('users').update({'status': 'rejected'}).eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error in reject_user: {e}")
 
 def remove_user(user_id):
     """Remove user from database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM users WHERE user_id = %s', (user_id,))
-            cursor.execute('DELETE FROM user_sessions WHERE user_id = %s', (user_id,))
-            conn.commit()
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        # Delete from user_sessions first (due to foreign key)
+        supabase.table('user_sessions').delete().eq('user_id', user_id).execute()
+        # Then delete from users
+        supabase.table('users').delete().eq('user_id', user_id).execute()
+    except Exception as e:
+        logger.error(f"Error in remove_user: {e}")
 
 def get_pending_users():
     """Get list of pending users"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id, username FROM users WHERE status = %s', ('pending',))
-            results = cursor.fetchall()
-            return results
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        result = supabase.table('users').select('user_id, username').eq('status', 'pending').execute()
+        return [(user['user_id'], user['username']) for user in result.data] if result.data else []
+    except Exception as e:
+        logger.error(f"Error in get_pending_users: {e}")
+        return []
 
 def get_all_users():
     """Get all users"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('SELECT user_id, username, status FROM users')
-            results = cursor.fetchall()
-            return results
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        result = supabase.table('users').select('user_id, username, status').execute()
+        return [(user['user_id'], user['username'], user['status']) for user in result.data] if result.data else []
+    except Exception as e:
+        logger.error(f"Error in get_all_users: {e}")
+        return []
 
 def update_user_session(user_id, service=None, country=None, range_id=None, number=None, monitoring=0):
     """Update user session in database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO user_sessions 
-                (user_id, selected_service, selected_country, range_id, number, monitoring, last_check)
-                VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    selected_service = EXCLUDED.selected_service,
-                    selected_country = EXCLUDED.selected_country,
-                    range_id = EXCLUDED.range_id,
-                    number = EXCLUDED.number,
-                    monitoring = EXCLUDED.monitoring,
-                    last_check = CURRENT_TIMESTAMP
-            ''', (user_id, service, country, range_id, number, monitoring))
-            conn.commit()
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        session_data = {
+            'user_id': user_id,
+            'selected_service': service,
+            'selected_country': country,
+            'range_id': range_id,
+            'number': number,
+            'monitoring': monitoring,
+            'last_check': datetime.now().isoformat()
+        }
+        # Check if session exists
+        existing = supabase.table('user_sessions').select('user_id').eq('user_id', user_id).execute()
+        if existing.data:
+            # Update
+            supabase.table('user_sessions').update(session_data).eq('user_id', user_id).execute()
+        else:
+            # Insert
+            supabase.table('user_sessions').insert(session_data).execute()
+    except Exception as e:
+        logger.error(f"Error in update_user_session: {e}")
 
 def get_user_session(user_id):
     """Get user session from database"""
-    with db_lock:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute('''
-                SELECT user_id, selected_service as service, selected_country as country, 
-                       range_id, number, monitoring 
-                FROM user_sessions WHERE user_id = %s
-            ''', (user_id,))
-            result = cursor.fetchone()
-            if result:
-                return dict(result)
-            return None
-        finally:
-            if conn:
-                cursor.close()
-                db_pool.putconn(conn)
+    try:
+        result = supabase.table('user_sessions').select('*').eq('user_id', user_id).execute()
+        if result.data and len(result.data) > 0:
+            session = result.data[0]
+            return {
+                'user_id': session['user_id'],
+                'service': session.get('selected_service'),
+                'country': session.get('selected_country'),
+                'range_id': session.get('range_id'),
+                'number': session.get('number'),
+                'monitoring': session.get('monitoring', 0)
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error in get_user_session: {e}")
+        return None
 
 # API Functions (from otp_tool.py)
 class APIClient:
