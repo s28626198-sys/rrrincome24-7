@@ -895,6 +895,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Country selection
     elif data.startswith("country_"):
+        # Re-check approval status for security
+        status = get_user_status(user_id)
+        if status != 'approved':
+            await query.edit_message_text("❌ Your access is pending approval.")
+            return
+        
         parts = data.split("_", 2)
         service_name = parts[1]
         country = parts[2]
@@ -1013,6 +1019,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Back to services
     elif data == "back_services":
+        # Re-check approval status for security
+        status = get_user_status(user_id)
+        if status != 'approved':
+            await query.edit_message_text("❌ Your access is pending approval.")
+            return
+        
         keyboard = [
             [InlineKeyboardButton("💬 WhatsApp", callback_data="service_whatsapp")],
             [InlineKeyboardButton("👥 Facebook", callback_data="service_facebook")],
