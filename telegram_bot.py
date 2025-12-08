@@ -1223,13 +1223,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Start monitoring in background
             import time
-            # Check if job_queue is available
-            if context.job_queue is None:
-                logger.warning("JobQueue not available. Cannot start OTP monitoring.")
-                await update.message.reply_text("❌ Error: JobQueue not initialized. Please contact admin.")
-                return
+            # Check if job_queue is available - try context.job_queue first, then application.job_queue
+            job_queue = context.job_queue
+            if job_queue is None:
+                # Fallback to application's job_queue
+                global application
+                if application and application.job_queue:
+                    job_queue = application.job_queue
+                    logger.info(f"Using application.job_queue for user {user_id}")
+                else:
+                    logger.error(f"JobQueue not available for user {user_id}. Context: {context.job_queue}, Application: {application.job_queue if application else 'None'}")
+                    await update.message.reply_text("❌ Error: JobQueue not initialized. Please contact admin.")
+                    return
             
-            job = context.job_queue.run_repeating(
+            job = job_queue.run_repeating(
                 monitor_otp,
                 interval=2,
                 first=2,
@@ -1237,6 +1244,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data={'number': number, 'user_id': user_id, 'country': country_name, 'service': service_name, 'start_time': time.time()}
             )
             user_jobs[user_id] = job
+            logger.info(f"✅ Started OTP monitoring job for user {user_id}, number {number}")
             
             # Make number clickable - ensure it has + prefix for Telegram auto-detection
             display_number = number
@@ -1522,6 +1530,12 @@ def init_application_if_needed():
             loop.run_until_complete(application.initialize())
             loop.run_until_complete(application.start())
             logger.info("✅ Application initialized and started for webhook mode")
+            
+            # Verify JobQueue is available
+            if application.job_queue:
+                logger.info("✅ JobQueue is available and running")
+            else:
+                logger.warning("⚠️ JobQueue is not available - OTP monitoring may not work")
         else:
             logger.warning("Failed to setup webhook, application may not work correctly")
 
