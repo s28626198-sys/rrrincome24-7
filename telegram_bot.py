@@ -1551,6 +1551,7 @@ def initialize_webhook_once():
             
             async def set_webhook_async():
                 try:
+                    # Just set webhook, don't initialize/start application for webhook mode
                     await application.bot.set_webhook(
                         url=f"{webhook_url}/webhook",
                         allowed_updates=Update.ALL_TYPES,
@@ -1580,6 +1581,13 @@ def initialize_webhook_once():
             logger.error(f"Failed to initialize webhook: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+# Initialize webhook when Flask app starts (using startup event for Flask 2.2+)
+@flask_app.before_request
+def before_request():
+    """Initialize webhook before first request"""
+    if not webhook_initialized:
+        initialize_webhook_once()
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
