@@ -42,13 +42,23 @@ SUPABASE_DB_PASSWORD=your_database_password
 
 ### 3. Deploy to Render
 
+#### Option A: Using render.yaml (Recommended)
+1. Connect your GitHub repository to Render
+2. Render will automatically detect `render.yaml` and use the configuration
+3. Add all environment variables from step 2 in Render dashboard
+4. Deploy!
+
+#### Option B: Manual Setup
 1. Connect your GitHub repository to Render
 2. Create a new Web Service
 3. Settings:
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python telegram_bot.py`
+   - **Start Command**: `gunicorn -w 1 -b 0.0.0.0:$PORT telegram_bot:flask_app`
    - **Environment**: Python 3
-4. Add all environment variables from step 2
+4. Add all environment variables from step 2:
+   - `USE_WEBHOOK=true`
+   - `WEBHOOK_URL` (will be auto-set, or use your Render service URL)
+   - All other variables from step 2
 5. Deploy!
 
 ## Local Development

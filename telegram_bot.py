@@ -1552,12 +1552,24 @@ def run_webhook():
     
     # Set webhook
     logger.info(f"Setting webhook to: {webhook_url}/webhook")
-    app.bot.set_webhook(url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES)
-    logger.info("✅ Webhook set successfully")
-    
-    # Start Flask server
-    logger.info(f"Starting Flask server on port {port}...")
-    flask_app.run(host='0.0.0.0', port=port, debug=False)
+    try:
+        app.bot.set_webhook(url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES)
+        logger.info("✅ Webhook set successfully")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        raise
+
+# Initialize app if running in webhook mode (for gunicorn)
+if os.getenv("USE_WEBHOOK", "false").lower() == "true":
+    logger.info("Initializing bot in webhook mode...")
+    webhook_url = os.getenv("WEBHOOK_URL", "")
+    if webhook_url:
+        try:
+            app = create_app()
+            app.bot.set_webhook(url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES)
+            logger.info(f"✅ Webhook initialized: {webhook_url}/webhook")
+        except Exception as e:
+            logger.error(f"Failed to initialize webhook: {e}")
 
 if __name__ == "__main__":
     # Check if running in production (webhook mode) or development (polling mode)
