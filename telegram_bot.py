@@ -1,17 +1,20 @@
 import os
+import sys
 import threading
 import time
+import signal
 from datetime import datetime
 import requests
 import json
 import re
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import logging
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
-from flask import Flask, request
+from flask import Flask, request, Response
 
 # Try to import cloudscraper for Cloudflare bypass
 try:
@@ -1500,47 +1503,90 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
 # Global application instance
 application = None
 
-def create_app():
-    """Create and configure the Telegram bot application"""
+# ==================== FLASK APP (for Webhook) ====================
+flask_app = Flask(__name__)
+
+# Global event loop for webhook mode
+webhook_loop = None
+
+def get_or_create_event_loop():
+    """Get existing event loop or create new one"""
+    global webhook_loop
+    try:
+        if webhook_loop is None or webhook_loop.is_closed():
+            webhook_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(webhook_loop)
+        return webhook_loop
+    except RuntimeError:
+        webhook_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(webhook_loop)
+        return webhook_loop
+
+@flask_app.route('/')
+def health_check():
+    """Health check endpoint for Render"""
+    return Response('OK - Bot is running', status=200)
+
+@flask_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Handle incoming Telegram updates via webhook"""
+    if request.method == 'POST':
+        try:
+            json_data = request.get_json(force=True)
+            update = Update.de_json(json_data, application.bot)
+            
+            # Use persistent event loop
+            loop = get_or_create_event_loop()
+            loop.run_until_complete(application.process_update(update))
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            import traceback
+            traceback.print_exc()
+        return Response('OK', status=200)
+    return Response('Method not allowed', status=405)
+
+def setup_webhook():
+    """Setup webhook for Telegram bot"""
+    # Get Render URL from environment or use WEBHOOK_URL
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        render_url = os.environ.get('WEBHOOK_URL', '')
+    
+    if render_url:
+        webhook_url = f"{render_url}/webhook" if not render_url.endswith('/webhook') else render_url
+        
+        # Delete any existing webhook first
+        delete_url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        try:
+            requests.get(delete_url, timeout=5)
+            time.sleep(1)
+        except:
+            pass
+        
+        # Set new webhook
+        set_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+        response = requests.post(set_url, json={
+            'url': webhook_url,
+            'drop_pending_updates': True,
+            'allowed_updates': ['message', 'callback_query']
+        }, timeout=10)
+        
+        if response.status_code == 200:
+            logger.info(f"✅ Webhook set successfully: {webhook_url}")
+            return True
+        else:
+            logger.error(f"❌ Failed to set webhook: {response.text}")
+            return False
+    else:
+        logger.warning("⚠️ RENDER_EXTERNAL_URL or WEBHOOK_URL not set, running in polling mode")
+        return False
+
+def main():
+    """Start the bot"""
     global application
     
-    # Initialize database on startup
-    try:
-        init_database()
-        logger.info("✅ Database initialized successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize database: {e}")
-        logger.warning("Bot will continue but database operations may fail")
-    
-    # Initialize global API client (login will retry on first API call if needed)
-    logger.info("Initializing global API client...")
-    api_client = get_global_api_client()
-    if api_client:
-        logger.info("✅ API client initialized (login will retry on first API call if needed)")
-    
-    # Create application for webhook mode
-    # For webhook, we need to provide an update queue
-    try:
-        import asyncio
-        from asyncio import Queue
-        
-        # Create update queue for webhook mode
-        update_queue = Queue()
-        
-        # Build application with update queue for webhook
-        builder = Application.builder().token(BOT_TOKEN)
-        
-        # Set update queue for webhook mode
-        if os.getenv("USE_WEBHOOK", "false").lower() == "true":
-            builder = builder.update_queue(update_queue)
-        
-        application = builder.build()
-        logger.info("✅ Telegram Application created successfully")
-    except Exception as e:
-        logger.error(f"Failed to create Application: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
@@ -1550,221 +1596,88 @@ def create_app():
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    return application
-
-def main():
-    """Start the bot in polling mode (for local development)"""
-    app = create_app()
-    logger.info("Bot starting in polling mode...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-# Flask app for webhook
-flask_app = Flask(__name__)
-webhook_initialized = False
-_initialization_lock = threading.Lock()
-
-# Persistent event loop for webhook processing (runs in background thread)
-_webhook_loop = None
-_webhook_loop_thread = None
-
-def initialize_webhook_once():
-    """Initialize webhook once on startup"""
-    global application, webhook_initialized
+    logger.info("Bot started!")
+    logger.info(f"Admin User ID: {ADMIN_USER_ID}")
     
-    with _initialization_lock:
-        if webhook_initialized:
-            return
+    # Check if running on Render (webhook mode) or locally (polling mode)
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        render_url = os.environ.get('WEBHOOK_URL', '')
+    
+    if render_url:
+        # Webhook mode for Render
+        logger.info("🌐 Running in WEBHOOK mode (Render)")
         
-        logger.info("Initializing bot application and webhook...")
-        
-        # Create application
-        if application is None:
-            create_app()
-        
-        # Set webhook
-        webhook_url = os.getenv("WEBHOOK_URL", "")
-        if webhook_url and application:
+        # Setup webhook
+        if setup_webhook():
+            # Initialize database
             try:
-                import asyncio
-                
-                async def set_webhook_async():
-                    try:
-                        # Initialize application first
-                        await application.initialize()
-                        await application.bot.set_webhook(
-                            url=f"{webhook_url}/webhook",
-                            allowed_updates=Update.ALL_TYPES,
-                            drop_pending_updates=True
-                        )
-                        # Start the application to process updates
-                        await application.start()
-                        logger.info(f"✅ Webhook set successfully: {webhook_url}/webhook")
-                    except Exception as e:
-                        logger.error(f"Failed to set webhook: {e}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                        raise
-                
-                # Use the persistent webhook loop for initialization
-                global _webhook_loop
-                if _webhook_loop is None or _webhook_loop.is_closed():
-                    start_webhook_loop()
-                    time.sleep(0.5)  # Wait for loop to be ready
-                
-                # Schedule webhook setup in background loop
-                future = asyncio.run_coroutine_threadsafe(set_webhook_async(), _webhook_loop)
-                future.result(timeout=30)
-                
-                webhook_initialized = True
-                logger.info("✅ Webhook initialization completed")
-                
+                init_database()
+                logger.info("✅ Database initialized successfully")
             except Exception as e:
-                logger.error(f"Failed to initialize webhook: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-
-# Initialize webhook when Flask app starts
-@flask_app.before_request
-def before_request():
-    """Initialize webhook before first request"""
-    if not webhook_initialized:
-        initialize_webhook_once()
-
-# Start persistent event loop in background thread for webhook processing
-def start_webhook_loop():
-    """Start persistent event loop in background thread"""
-    global _webhook_loop, _webhook_loop_thread
-    
-    if _webhook_loop_thread and _webhook_loop_thread.is_alive():
-        return
-    
-    def run_loop():
-        global _webhook_loop
-        _webhook_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_webhook_loop)
-        _webhook_loop.run_forever()
-    
-    _webhook_loop_thread = threading.Thread(target=run_loop, daemon=True)
-    _webhook_loop_thread.start()
-    logger.info("Background event loop thread started for webhook processing")
-
-# Also initialize on app startup (when gunicorn loads the module)
-if os.getenv("USE_WEBHOOK", "false").lower() == "true":
-    # Start persistent event loop first
-    start_webhook_loop()
-    
-    # Use threading to initialize in background to not block
-    def init_in_background():
-        time.sleep(2)  # Wait a bit for Flask to be ready
-        initialize_webhook_once()
-    
-    init_thread = threading.Thread(target=init_in_background, daemon=True)
-    init_thread.start()
-    logger.info("Webhook initialization thread started")
-
-@flask_app.route('/webhook', methods=['POST'])
-def webhook():
-    """Handle incoming webhook updates"""
-    global application
-    
-    # Initialize webhook on first request
-    if not webhook_initialized:
-        initialize_webhook_once()
-    
-    if application is None:
-        create_app()
-    
-    try:
-        update = Update.de_json(request.json, application.bot)
-        
-        # Process update asynchronously
-        import asyncio
-        
-        async def process_update_async():
-            await application.process_update(update)
-        
-        # Get or create event loop
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        
-        if loop.is_running():
-            # If loop is running, use run_coroutine_threadsafe or create_task
-            asyncio.ensure_future(process_update_async())
+                logger.error(f"❌ Failed to initialize database: {e}")
+                logger.warning("Bot will continue but database operations may fail")
+            
+            # Initialize global API client
+            logger.info("Initializing global API client...")
+            api_client = get_global_api_client()
+            if api_client:
+                logger.info("✅ API client initialized")
+            
+            # Initialize the application
+            loop = get_or_create_event_loop()
+            loop.run_until_complete(application.initialize())
+            loop.run_until_complete(application.start())
+            
+            # Start Flask server
+            port = int(os.environ.get('PORT', 10000))
+            logger.info(f"🚀 Starting Flask server on port {port}")
+            flask_app.run(host='0.0.0.0', port=port, threaded=True)
         else:
-            loop.run_until_complete(process_update_async())
+            logger.error("Failed to setup webhook, falling back to polling")
+            run_polling_mode()
+    else:
+        # Polling mode for local development
+        logger.info("🔄 Running in POLLING mode (Local)")
         
-        return 'OK', 200
+        # Initialize database
+        try:
+            init_database()
+            logger.info("✅ Database initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize database: {e}")
+            logger.warning("Bot will continue but database operations may fail")
+        
+        # Initialize global API client
+        logger.info("Initializing global API client...")
+        api_client = get_global_api_client()
+        if api_client:
+            logger.info("✅ API client initialized")
+        
+        run_polling_mode()
+
+def run_polling_mode():
+    """Run bot in polling mode (for local development)"""
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            stop_signals=None
+        )
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user (KeyboardInterrupt)")
     except Exception as e:
-        logger.error(f"Error processing webhook update: {e}")
+        logger.error(f"Bot error: {e}")
         import traceback
-        logger.error(traceback.format_exc())
-        return 'Error', 500
-
-@flask_app.route('/health', methods=['GET'])
-def health():
-    """Health check endpoint"""
-    return {'status': 'ok'}, 200
-
-@flask_app.route('/', methods=['GET'])
-def index():
-    """Root endpoint"""
-    global webhook_initialized, application
-    status = {
-        'status': 'Telegram Bot Webhook Server',
-        'health': '/health',
-        'webhook_initialized': webhook_initialized,
-        'application_ready': application is not None
-    }
-    return status, 200
-
-@flask_app.route('/init', methods=['GET', 'POST'])
-def init_webhook():
-    """Manual webhook initialization endpoint"""
-    global webhook_initialized
-    if webhook_initialized:
-        return {'status': 'Webhook already initialized'}, 200
-    try:
-        initialize_webhook_once()
-        return {'status': 'Webhook initialization triggered', 'initialized': webhook_initialized}, 200
-    except Exception as e:
-        return {'status': 'Error', 'error': str(e)}, 500
-
-def run_webhook():
-    """Start the bot in webhook mode (for production)"""
-    global application
-    
-    # Get webhook URL from environment
-    webhook_url = os.getenv("WEBHOOK_URL", "")
-    port = int(os.getenv("PORT", 5000))
-    
-    if not webhook_url:
-        logger.error("WEBHOOK_URL environment variable not set!")
-        logger.info("Falling back to polling mode...")
-        main()
-        return
-    
-    # Create application
-    app = create_app()
-    
-    # Set webhook
-    logger.info(f"Setting webhook to: {webhook_url}/webhook")
-    try:
-        app.bot.set_webhook(url=f"{webhook_url}/webhook", allowed_updates=Update.ALL_TYPES)
-        logger.info("✅ Webhook set successfully")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
-        raise
-
-# Note: Webhook will be set when Flask app starts, not during module import
-# This avoids issues with Application object initialization
+        traceback.print_exc()
+    finally:
+        logger.info("Bot shutdown complete")
+        if application:
+            try:
+                application.stop()
+            except:
+                pass
 
 if __name__ == "__main__":
-    # Check if running in production (webhook mode) or development (polling mode)
-    if os.getenv("USE_WEBHOOK", "false").lower() == "true":
-        run_webhook()
-    else:
-        main()
+    main()
 
