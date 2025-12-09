@@ -1461,16 +1461,113 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
 # Global application instance
 application = None
 
-# ==================== FLASK APP (for Webhook) ====================
-flask_app = Flask(__name__)
-
 # Global event loop for webhook mode - used by background thread for JobQueue
 bot_event_loop = None
+bot_thread = None
 
 def get_bot_event_loop():
     """Get the bot's event loop (running in background thread for JobQueue)"""
     global bot_event_loop
     return bot_event_loop
+
+def init_application_for_webhook():
+    """Initialize application for webhook mode (called when module is imported by Gunicorn)"""
+    global application, bot_event_loop, bot_thread
+    
+    # Only initialize if not already initialized
+    if application is not None:
+        return
+    
+    logger.info("🔄 Initializing application for webhook mode...")
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("users", admin_commands))
+    application.add_handler(CommandHandler("remove", admin_commands))
+    application.add_handler(CommandHandler("pending", admin_commands))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    logger.info("✅ Application created with handlers")
+    
+    # Initialize database
+    try:
+        init_database()
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}")
+        logger.warning("Bot will continue but database operations may fail")
+    
+    # Initialize global API client
+    logger.info("Initializing global API client...")
+    api_client = get_global_api_client()
+    if api_client:
+        logger.info("✅ API client initialized")
+    
+    # Get Render URL
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        render_url = os.environ.get('WEBHOOK_URL', '')
+    
+    if render_url:
+        # Setup webhook
+        if setup_webhook(render_url):
+            # Create event loop for background thread (JobQueue needs continuous loop)
+            bot_event_loop = asyncio.new_event_loop()
+            
+            # Initialize and start application in background thread - JobQueue needs continuous loop
+            def run_bot():
+                global bot_event_loop
+                try:
+                    logger.info("🔄 Starting bot background thread...")
+                    # Set this loop as the thread's event loop
+                    asyncio.set_event_loop(bot_event_loop)
+                    logger.info("✅ Event loop set for background thread")
+                    
+                    # Initialize and start application
+                    logger.info("🔄 Initializing application...")
+                    bot_event_loop.run_until_complete(application.initialize())
+                    logger.info("✅ Application initialized")
+                    
+                    logger.info("🔄 Starting application...")
+                    bot_event_loop.run_until_complete(application.start())
+                    logger.info("✅ Application started for webhook mode")
+                    
+                    # Verify JobQueue is available
+                    if application.job_queue:
+                        logger.info("✅ JobQueue is available and running")
+                        logger.info(f"✅ JobQueue scheduler: {application.job_queue.scheduler}")
+                    else:
+                        logger.error("❌ JobQueue is NOT available - OTP monitoring will NOT work")
+                    
+                    # Keep event loop running for JobQueue
+                    logger.info("🔄 Event loop running forever for JobQueue...")
+                    bot_event_loop.run_forever()
+                except Exception as e:
+                    logger.error(f"❌ Error in bot thread: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Start bot in background thread so event loop keeps running for JobQueue
+            bot_thread = threading.Thread(target=run_bot, daemon=True)
+            bot_thread.start()
+            
+            # Give bot time to initialize
+            time.sleep(3)
+            logger.info("✅ Bot initialization complete for webhook mode")
+        else:
+            logger.error("❌ Failed to setup webhook")
+
+# ==================== FLASK APP (for Webhook) ====================
+flask_app = Flask(__name__)
+
+# Initialize application when module is imported (for Gunicorn)
+# Check if running on Render (has RENDER_EXTERNAL_URL)
+if os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('WEBHOOK_URL'):
+    init_application_for_webhook()
 
 @flask_app.route('/')
 def health_check():
@@ -1537,8 +1634,22 @@ def webhook():
     return Response('Method not allowed', status=405)
 
 def main():
-    """Start the bot in WEBHOOK mode for Render"""
-    global application, bot_event_loop
+    """Start the bot - for local development (polling mode)"""
+    global application
+    
+    # Only run main() for local development (when no Render URL)
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
+    if not render_url:
+        render_url = os.environ.get('WEBHOOK_URL', '')
+    
+    if render_url:
+        # Webhook mode - already initialized by init_application_for_webhook()
+        logger.info("🌐 Running in WEBHOOK mode (Render) - already initialized")
+        logger.info("🚀 Flask app is ready for Gunicorn")
+        return
+    
+    # Local development - use polling (like backup bot)
+    logger.info("🔄 Running in POLLING mode (Local)")
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
@@ -1568,80 +1679,18 @@ def main():
     if api_client:
         logger.info("✅ API client initialized")
     
-    # Get Render URL
-    render_url = os.environ.get('RENDER_EXTERNAL_URL', '')
-    if not render_url:
-        render_url = os.environ.get('WEBHOOK_URL', '')
-    
-    if render_url:
-        # Webhook mode for Render
-        logger.info("🌐 Running in WEBHOOK mode (Render)")
-        
-        # Setup webhook
-        if setup_webhook(render_url):
-            # Create event loop for background thread (JobQueue needs continuous loop)
-            bot_event_loop = asyncio.new_event_loop()
-            
-            # Initialize and start application in background thread - JobQueue needs continuous loop
-            def run_bot():
-                global bot_event_loop
-                try:
-                    logger.info("🔄 Starting bot background thread...")
-                    # Set this loop as the thread's event loop
-                    asyncio.set_event_loop(bot_event_loop)
-                    logger.info("✅ Event loop set for background thread")
-                    
-                    # Initialize and start application
-                    logger.info("🔄 Initializing application...")
-                    bot_event_loop.run_until_complete(application.initialize())
-                    logger.info("✅ Application initialized")
-                    
-                    logger.info("🔄 Starting application...")
-                    bot_event_loop.run_until_complete(application.start())
-                    logger.info("✅ Application started for webhook mode")
-                    
-                    # Verify JobQueue is available
-                    if application.job_queue:
-                        logger.info("✅ JobQueue is available and running")
-                        logger.info(f"✅ JobQueue scheduler: {application.job_queue.scheduler}")
-                    else:
-                        logger.error("❌ JobQueue is NOT available - OTP monitoring will NOT work")
-                    
-                    # Keep event loop running for JobQueue
-                    logger.info("🔄 Event loop running forever for JobQueue...")
-                    bot_event_loop.run_forever()
-                except Exception as e:
-                    logger.error(f"❌ Error in bot thread: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Start bot in background thread so event loop keeps running for JobQueue
-            bot_thread = threading.Thread(target=run_bot, daemon=True)
-            bot_thread.start()
-            
-            # Give bot time to initialize
-            time.sleep(3)
-            
-            # Start Flask server in main thread
-            port = int(os.environ.get('PORT', 10000))
-            logger.info(f"🚀 Starting Flask server on port {port}")
-            flask_app.run(host='0.0.0.0', port=port, threaded=True)
-        else:
-            logger.error("Failed to setup webhook")
-    else:
-        # Local development - use polling
-        logger.info("🔄 Running in POLLING mode (Local)")
-        try:
-            application.run_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by user")
-        except Exception as e:
-            logger.error(f"Bot error: {e}")
-            import traceback
-            traceback.print_exc()
+    # Run in polling mode (EXACTLY like backup bot)
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Bot error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def setup_webhook(render_url):
     """Setup webhook for Telegram bot"""
