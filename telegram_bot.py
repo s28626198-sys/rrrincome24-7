@@ -1495,10 +1495,20 @@ def webhook():
             json_data = request.get_json(force=True)
             update = Update.de_json(json_data, application.bot)
             
-            # Use persistent event loop (exactly like working bot)
-            # Working bot: loop.run_until_complete(bot_application.process_update(update))
+            # Use persistent event loop - check if running to handle properly
             loop = get_or_create_event_loop()
-            loop.run_until_complete(application.process_update(update))
+            
+            # If loop is already running (for JobQueue), schedule coroutine
+            # Otherwise use run_until_complete directly
+            if loop.is_running():
+                # Loop running in background (JobQueue), schedule safely
+                asyncio.run_coroutine_threadsafe(
+                    application.process_update(update),
+                    loop
+                )
+            else:
+                # Loop not running, can use run_until_complete
+                loop.run_until_complete(application.process_update(update))
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             import traceback
