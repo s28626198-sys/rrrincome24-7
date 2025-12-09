@@ -1563,17 +1563,6 @@ def init_application_if_needed():
             else:
                 logger.warning("⚠️ JobQueue is not available - OTP monitoring may not work")
             
-            # Start event loop in background thread to keep JobQueue running
-            # The loop needs to run continuously to process scheduled jobs
-            def run_event_loop_forever():
-                asyncio.set_event_loop(loop)
-                # Keep loop running to process JobQueue tasks
-                loop.run_forever()
-            
-            import threading
-            event_loop_thread = threading.Thread(target=run_event_loop_forever, daemon=True)
-            event_loop_thread.start()
-            logger.info("✅ Started background event loop thread for JobQueue")
         else:
             logger.warning("Failed to setup webhook, application may not work correctly")
 
@@ -1671,17 +1660,6 @@ def main():
             else:
                 logger.warning("⚠️ JobQueue is not available - OTP monitoring may not work")
             
-            # Start event loop in background thread to keep JobQueue running
-            # The loop needs to run continuously to process scheduled jobs
-            def run_event_loop_forever():
-                asyncio.set_event_loop(loop)
-                # Keep loop running to process JobQueue tasks
-                loop.run_forever()
-            
-            import threading
-            event_loop_thread = threading.Thread(target=run_event_loop_forever, daemon=True)
-            event_loop_thread.start()
-            logger.info("✅ Started background event loop thread for JobQueue")
             
             # Start Flask server
             port = int(os.environ.get('PORT', 10000))
