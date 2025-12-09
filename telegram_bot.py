@@ -1457,15 +1457,7 @@ flask_app = Flask(__name__)
 # Global event loop for webhook mode
 webhook_loop = None
 
-def get_or_create_event_loop():
-    """Get existing event loop (exactly like working bot)"""
-    try:
-        loop = asyncio.get_event_loop()
-        return loop
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        return loop
+# Removed get_or_create_event_loop() - using asyncio.get_event_loop() directly like working bot
 
 
 @flask_app.route('/')
@@ -1493,7 +1485,7 @@ def webhook():
             update = Update.de_json(json_data, application.bot)
             
             # Use persistent event loop (exactly like working bot)
-            loop = get_or_create_event_loop()
+            loop = asyncio.get_event_loop()
             loop.run_until_complete(application.process_update(update))
         except Exception as e:
             logger.error(f"Webhook error: {e}")
@@ -1544,8 +1536,8 @@ def init_application_if_needed():
     if render_url:
         # Setup webhook
         if setup_webhook():
-            # Initialize the application - use main thread's event loop (like working bot)
-            loop = get_or_create_event_loop()
+            # Initialize the application (exactly like working bot)
+            loop = asyncio.get_event_loop()
             
             # Initialize and start application in main thread BEFORE starting Flask server
             # This matches working bot pattern exactly: initialize/start first, then run Flask
@@ -1641,8 +1633,8 @@ def main():
             if api_client:
                 logger.info("✅ API client initialized")
             
-            # Initialize the application - use main thread's event loop (like working bot)
-            loop = get_or_create_event_loop()
+            # Initialize the application (exactly like working bot)
+            loop = asyncio.get_event_loop()
             
             # Initialize and start application in main thread BEFORE starting Flask server
             # This matches working bot pattern exactly: initialize/start first, then run Flask
@@ -1706,16 +1698,14 @@ def run_polling_mode():
             except:
                 pass
 
-# Initialize application when module is imported (for gunicorn)
-if os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('WEBHOOK_URL'):
-    # Running in webhook mode - initialize when module loads
-    try:
-        init_application_if_needed()
-    except Exception as e:
-        logger.error(f"Failed to initialize application on import: {e}")
-        import traceback
-        traceback.print_exc()
-
 if __name__ == "__main__":
     main()
+else:
+    # When running with gunicorn (Render), main() might not be called automatically
+    # So we need to initialize on module import
+    render_url = os.environ.get('RENDER_EXTERNAL_URL', '') or os.environ.get('WEBHOOK_URL', '')
+    if render_url:
+        # For gunicorn, we need to call main() to initialize
+        # But we can't block, so just ensure application exists when webhook is called
+        pass
 
