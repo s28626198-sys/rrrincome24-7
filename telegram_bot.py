@@ -1644,70 +1644,27 @@ def webhook():
                 update_type = f"callback_query: {update.callback_query.data}"
             logger.info(f"📨 Received update: {update_type}, update_id: {update.update_id}")
             
-            # Process update using the background event loop (where JobQueue is running)
-            loop = get_bot_event_loop()
-            if loop and not loop.is_closed():
-                if loop.is_running():
-                    try:
-                        # In webhook mode, we need to manually process updates using process_update()
-                        logger.info(f"🔄 Processing update {update.update_id} in background loop")
-                        
-                        # Create a coroutine that processes the update with detailed logging
-                        async def process_update_task():
-                            try:
-                                logger.info(f"🔄 Starting to process update {update.update_id}")
-                                result = await application.process_update(update)
-                                logger.info(f"✅ Update {update.update_id} processed successfully, result: {result}")
-                                return result
-                            except Exception as e:
-                                logger.error(f"❌ Error processing update {update.update_id}: {e}")
-                                import traceback
-                                logger.error(traceback.format_exc())
-                                raise
-                        
-                        # Use run_coroutine_threadsafe to schedule the coroutine properly
-                        # This is the correct way to schedule coroutines from a different thread
-                        future = asyncio.run_coroutine_threadsafe(
-                            process_update_task(),
-                            loop
-                        )
-                        logger.info(f"✅ Update {update.update_id} scheduled for processing (future: {future})")
-                        
-                        # Add callback to track completion
-                        def on_complete(fut):
-                            try:
-                                if fut.cancelled():
-                                    logger.warning(f"⚠️ Update {update.update_id} was cancelled")
-                                elif fut.exception():
-                                    logger.error(f"❌ Error in update {update.update_id}: {fut.exception()}")
-                                else:
-                                    logger.info(f"✅ Update {update.update_id} completed via callback")
-                            except Exception as e:
-                                logger.error(f"Error in callback: {e}")
-                        
-                        future.add_done_callback(on_complete)
-                    except Exception as e:
-                        logger.error(f"Error scheduling update to bot loop: {e}")
-                        import traceback
-                        traceback.print_exc()
-                else:
-                    logger.warning("Event loop exists but not running, trying to process directly")
-                    try:
-                        loop.run_until_complete(application.process_update(update))
-                    except Exception as e:
-                        logger.error(f"Direct processing failed: {e}")
-            else:
-                logger.error(f"Bot event loop not available - loop: {loop}, closed: {loop.is_closed() if loop else 'N/A'}")
-                # Fallback: try to process in current thread
+            # Process update directly in a new event loop (simpler and more reliable for webhook mode)
+            # This ensures the update is processed immediately without waiting for background loop
+            logger.info(f"🔄 Processing update {update.update_id} directly")
+            try:
+                # Create a new event loop for this update
+                temp_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(temp_loop)
+                
+                # Process the update
+                temp_loop.run_until_complete(application.process_update(update))
+                logger.info(f"✅ Update {update.update_id} processed successfully")
+                
+                temp_loop.close()
+            except Exception as e:
+                logger.error(f"❌ Error processing update {update.update_id}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 try:
-                    temp_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(temp_loop)
-                    temp_loop.run_until_complete(application.process_update(update))
                     temp_loop.close()
-                except Exception as e:
-                    logger.error(f"Fallback processing failed: {e}")
-                    import traceback
-                    traceback.print_exc()
+                except:
+                    pass
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             import traceback
