@@ -1652,7 +1652,7 @@ def webhook():
                         # In webhook mode, we need to manually process updates using process_update()
                         logger.info(f"🔄 Processing update {update.update_id} in background loop")
                         
-                        # Use call_soon_threadsafe to schedule the coroutine as a task
+                        # Create a coroutine that processes the update
                         async def process_update_task():
                             try:
                                 logger.info(f"🔄 Starting to process update {update.update_id}")
@@ -1663,10 +1663,18 @@ def webhook():
                                 import traceback
                                 logger.error(traceback.format_exc())
                         
-                        # Schedule the task in the event loop
-                        loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(process_update_task())
-                        )
+                        # Schedule the coroutine to run in the background event loop
+                        # Use call_soon_threadsafe to schedule a callback that creates the task
+                        def schedule_task():
+                            try:
+                                task = asyncio.create_task(process_update_task())
+                                logger.info(f"✅ Task created for update {update.update_id}")
+                            except Exception as e:
+                                logger.error(f"❌ Error creating task for update {update.update_id}: {e}")
+                                import traceback
+                                logger.error(traceback.format_exc())
+                        
+                        loop.call_soon_threadsafe(schedule_task)
                         logger.info(f"✅ Update {update.update_id} scheduled for processing")
                     except Exception as e:
                         logger.error(f"Error scheduling update to bot loop: {e}")
