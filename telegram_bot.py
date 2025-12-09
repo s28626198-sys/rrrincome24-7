@@ -1499,18 +1499,28 @@ def webhook():
             json_data = request.get_json(force=True)
             update = Update.de_json(json_data, application.bot)
             
-            # Get the background event loop (running in background thread for JobQueue)
+            # Use the same event loop approach as working bot
+            # The loop is already running in background thread for JobQueue
             loop = get_background_loop()
             
-            if loop and loop.is_running():
-                # Loop is running in background thread, schedule coroutine safely
-                # Don't wait for result - Telegram expects quick response
-                asyncio.run_coroutine_threadsafe(
-                    application.process_update(update),
-                    loop
-                )
+            if loop and not loop.is_closed():
+                # Schedule in the running loop but don't block webhook response
+                # This matches working bot pattern but allows async execution
+                try:
+                    # Use call_soon_threadsafe to schedule in running loop
+                    future = asyncio.run_coroutine_threadsafe(
+                        application.process_update(update),
+                        loop
+                    )
+                    # Don't wait - let it process asynchronously
+                    # Telegram gets quick response, update processes in background
+                except RuntimeError as e:
+                    # If loop is closed, use new loop
+                    logger.warning(f"Background loop issue: {e}, using temp loop")
+                    temp_loop = get_or_create_event_loop()
+                    temp_loop.run_until_complete(application.process_update(update))
             else:
-                # Loop not running yet, use temporary event loop
+                # Loop not available, create and run
                 temp_loop = get_or_create_event_loop()
                 temp_loop.run_until_complete(application.process_update(update))
         except Exception as e:
