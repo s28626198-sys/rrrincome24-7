@@ -1499,30 +1499,32 @@ def webhook():
             json_data = request.get_json(force=True)
             update = Update.de_json(json_data, application.bot)
             
-            # Use the same event loop approach as working bot
-            # The loop is already running in background thread for JobQueue
-            loop = get_background_loop()
+            # Use persistent event loop (exactly like working bot)
+            # Working bot uses: loop.run_until_complete(bot_application.process_update(update))
+            loop = get_or_create_event_loop()
             
-            if loop and not loop.is_closed():
-                # Schedule in the running loop but don't block webhook response
-                # This matches working bot pattern but allows async execution
-                try:
-                    # Use call_soon_threadsafe to schedule in running loop
-                    future = asyncio.run_coroutine_threadsafe(
+            # Try to use the same loop - if it's running in background thread, schedule
+            # Otherwise use run_until_complete directly
+            try:
+                if loop.is_running():
+                    # Loop is running in background thread, schedule coroutine
+                    asyncio.run_coroutine_threadsafe(
                         application.process_update(update),
                         loop
                     )
-                    # Don't wait - let it process asynchronously
-                    # Telegram gets quick response, update processes in background
-                except RuntimeError as e:
-                    # If loop is closed, use new loop
-                    logger.warning(f"Background loop issue: {e}, using temp loop")
-                    temp_loop = get_or_create_event_loop()
+                else:
+                    # Loop not running in this thread, can use run_until_complete
+                    loop.run_until_complete(application.process_update(update))
+            except Exception as loop_error:
+                # Fallback: create new loop if there's any issue
+                logger.warning(f"Loop issue: {loop_error}, using fallback")
+                try:
+                    temp_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(temp_loop)
                     temp_loop.run_until_complete(application.process_update(update))
-            else:
-                # Loop not available, create and run
-                temp_loop = get_or_create_event_loop()
-                temp_loop.run_until_complete(application.process_update(update))
+                    temp_loop.close()
+                except Exception as e:
+                    logger.error(f"Failed to process update: {e}")
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             import traceback
