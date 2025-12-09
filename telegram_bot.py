@@ -1618,6 +1618,14 @@ def webhook():
             if not update:
                 return Response('Invalid Update', status=400)
             
+            # Log update details for debugging
+            update_type = "unknown"
+            if update.message:
+                update_type = f"message: {update.message.text[:50] if update.message.text else 'no text'}"
+            elif update.callback_query:
+                update_type = f"callback_query: {update.callback_query.data}"
+            logger.info(f"📨 Received update: {update_type}, update_id: {update.update_id}")
+            
             # Process update using the background event loop (where JobQueue is running)
             loop = get_bot_event_loop()
             if loop and not loop.is_closed():
@@ -1628,8 +1636,27 @@ def webhook():
                             application.process_update(update),
                             loop
                         )
+                        logger.info(f"✅ Update {update.update_id} scheduled to background loop")
                         # Don't wait for result - return OK immediately to Telegram
                         # This prevents timeout errors
+                        # But check for exceptions after a short delay
+                        def check_result():
+                            try:
+                                # Check if there was an exception (non-blocking)
+                                if future.done():
+                                    exc = future.exception()
+                                    if exc:
+                                        logger.error(f"❌ Error processing update {update.update_id}: {exc}")
+                                        import traceback
+                                        traceback.print_exc()
+                                    else:
+                                        logger.info(f"✅ Update {update.update_id} processed successfully")
+                            except Exception as e:
+                                logger.error(f"Error checking future result: {e}")
+                        
+                        # Schedule result check after 1 second (non-blocking)
+                        import threading
+                        threading.Timer(1.0, check_result).start()
                     except Exception as e:
                         logger.error(f"Error scheduling update to bot loop: {e}")
                         import traceback
