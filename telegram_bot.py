@@ -1458,17 +1458,14 @@ flask_app = Flask(__name__)
 webhook_loop = None
 
 def get_or_create_event_loop():
-    """Get existing event loop or create new one"""
-    global webhook_loop
+    """Get existing event loop (exactly like working bot)"""
     try:
-        if webhook_loop is None or webhook_loop.is_closed():
-            webhook_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(webhook_loop)
-        return webhook_loop
+        loop = asyncio.get_event_loop()
+        return loop
     except RuntimeError:
-        webhook_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(webhook_loop)
-        return webhook_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 
 @flask_app.route('/')
@@ -1495,20 +1492,9 @@ def webhook():
             json_data = request.get_json(force=True)
             update = Update.de_json(json_data, application.bot)
             
-            # Use persistent event loop - check if running to handle properly
+            # Use persistent event loop (exactly like working bot)
             loop = get_or_create_event_loop()
-            
-            # If loop is already running (for JobQueue), schedule coroutine
-            # Otherwise use run_until_complete directly
-            if loop.is_running():
-                # Loop running in background (JobQueue), schedule safely
-                asyncio.run_coroutine_threadsafe(
-                    application.process_update(update),
-                    loop
-                )
-            else:
-                # Loop not running, can use run_until_complete
-                loop.run_until_complete(application.process_update(update))
+            loop.run_until_complete(application.process_update(update))
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             import traceback
