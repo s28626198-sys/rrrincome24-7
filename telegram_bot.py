@@ -1700,12 +1700,4 @@ def run_polling_mode():
 
 if __name__ == "__main__":
     main()
-else:
-    # When running with gunicorn (Render), main() might not be called automatically
-    # So we need to initialize on module import
-    render_url = os.environ.get('RENDER_EXTERNAL_URL', '') or os.environ.get('WEBHOOK_URL', '')
-    if render_url:
-        # For gunicorn, we need to call main() to initialize
-        # But we can't block, so just ensure application exists when webhook is called
-        pass
 
