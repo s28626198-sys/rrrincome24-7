@@ -45,7 +45,7 @@ except ImportError:
     HAS_CLOUDSCRAPER = False
 
 # Bot Configuration (from environment variables)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8348617982:AAGYXuOo6g8YNDTI079yf9nV0nf-zmFFHvA")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8348617982:AAGL_JyVqLJfa5G5csZES-IVYzCXOIJFFas")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "7325836764"))
 OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1002724043027"))  # Channel ID for forwarding OTP messages
 
