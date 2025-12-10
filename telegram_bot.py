@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import asyncio
 from datetime import datetime
 import requests
 import json
@@ -8,6 +9,7 @@ import re
 import hashlib
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Conflict
 import logging
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -2658,9 +2660,39 @@ def main():
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start bot
+    # Add error handler for conflict errors
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle errors, especially Conflict errors from multiple instances"""
+        error = context.error
+        if isinstance(error, Conflict):
+            logger.warning(f"⚠️ Conflict error detected: {error}. This usually means multiple bot instances are running. Waiting and retrying...")
+            # Wait a bit and let the other instance handle it, or this instance will take over
+            await asyncio.sleep(5)
+        else:
+            logger.error(f"❌ Error: {error}", exc_info=error)
+    
+    application.add_error_handler(error_handler)
+    
+    # Start bot with drop_pending_updates to avoid conflicts
     logger.info("Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
+    except Conflict as e:
+        logger.error(f"❌ Conflict error on startup: {e}. Another bot instance may be running.")
+        logger.info("💡 If you're sure only one instance should run, wait a few seconds and the bot will retry.")
+        # Wait and retry once
+        import time
+        time.sleep(10)
+        logger.info("🔄 Retrying bot startup...")
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False
+        )
 
 if __name__ == "__main__":
     main()
