@@ -111,10 +111,12 @@ def get_user_status(user_id):
     """Get user approval status from database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
-            result = supabase.table('users').select('status').eq('user_id', str(user_id)).execute()
+            # Use integer user_id (BIGINT in database)
+            result = supabase.table('users').select('status').eq('user_id', int(user_id)).execute()
             if result.data and len(result.data) > 0:
-                return result.data[0].get('status', 'pending')
+                status = result.data[0].get('status')
+                if status:
+                    return status
         # Return 'pending' if user doesn't exist (not None)
         return 'pending'
     except Exception as e:
@@ -126,9 +128,9 @@ def add_user(user_id, username):
     """Add new user to database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
+            # Use integer user_id (BIGINT in database)
             supabase.table('users').upsert({
-                'user_id': str(user_id),
+                'user_id': int(user_id),
                 'username': username,
                 'status': 'pending'
             }).execute()
@@ -139,11 +141,11 @@ def approve_user(user_id):
     """Approve user in database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
+            # Use integer user_id (BIGINT in database)
             supabase.table('users').update({
                 'status': 'approved',
                 'approved_at': datetime.now().isoformat()
-            }).eq('user_id', str(user_id)).execute()
+            }).eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error approving user: {e}")
 
@@ -151,10 +153,10 @@ def reject_user(user_id):
     """Reject user in database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
+            # Use integer user_id (BIGINT in database)
             supabase.table('users').update({
                 'status': 'rejected'
-            }).eq('user_id', str(user_id)).execute()
+            }).eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error rejecting user: {e}")
 
@@ -162,9 +164,9 @@ def remove_user(user_id):
     """Remove user from database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
-            supabase.table('users').delete().eq('user_id', str(user_id)).execute()
-            supabase.table('user_sessions').delete().eq('user_id', str(user_id)).execute()
+            # Use integer user_id (BIGINT in database)
+            supabase.table('users').delete().eq('user_id', int(user_id)).execute()
+            supabase.table('user_sessions').delete().eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error removing user: {e}")
 
@@ -192,9 +194,9 @@ def update_user_session(user_id, service=None, country=None, range_id=None, numb
     """Update user session in database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
+            # Use integer user_id (BIGINT in database)
             supabase.table('user_sessions').upsert({
-                'user_id': str(user_id),
+                'user_id': int(user_id),
                 'selected_service': service,
                 'selected_country': country,
                 'range_id': range_id,
@@ -209,8 +211,8 @@ def get_user_session(user_id):
     """Get user session from database"""
     try:
         with db_lock:
-            # Convert user_id to string for Supabase compatibility
-            result = supabase.table('user_sessions').select('*').eq('user_id', str(user_id)).execute()
+            # Use integer user_id (BIGINT in database)
+            result = supabase.table('user_sessions').select('*').eq('user_id', int(user_id)).execute()
             if result.data and len(result.data) > 0:
                 row = result.data[0]
                 return {
@@ -1154,8 +1156,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Get current status first (before adding user)
     status = get_user_status(user_id)
     
-    # Add user to database only if not exists (to avoid overwriting approved status)
-    if status == 'pending' or status is None:
+    # Add user to database only if status is 'pending' (user doesn't exist or is pending)
+    # This prevents overwriting approved/rejected status
+    if status == 'pending':
         add_user(user_id, username)
         # Re-check status after adding
         status = get_user_status(user_id)
