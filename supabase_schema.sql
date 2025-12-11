@@ -22,7 +22,7 @@ CREATE TABLE user_sessions (
     range_id TEXT,
     number TEXT,
     monitoring INTEGER DEFAULT 0,
-    number_count INTEGER DEFAULT 5,
+    number_count INTEGER DEFAULT 2,
     last_check TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
