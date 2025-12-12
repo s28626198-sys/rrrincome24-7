@@ -478,10 +478,12 @@ class APIClient:
             }
             headers["Origin"] = self.base_url
             headers["Referer"] = f"{self.base_url}/dashboard/getnum"
+            # API requires mhitauth as header, not query parameter
+            headers["mhitauth"] = self.auth_token
             
             # Reduced timeout for faster response
             resp = self.session.get(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}&mhitauth={self.auth_token}",
+                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
                 headers=headers,
                 timeout=8  # Reduced from 15 to 8 seconds
             )
@@ -492,7 +494,7 @@ class APIClient:
                 if self.login():
                     # Retry request once
                     resp = self.session.get(
-                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}&mhitauth={self.auth_token}",
+                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
                         headers=headers,
                         timeout=8
                     )
@@ -559,10 +561,12 @@ class APIClient:
             }
             headers["Origin"] = self.base_url
             headers["Referer"] = f"{self.base_url}/dashboard/getnum"
+            # API requires mhitauth as header, not query parameter
+            headers["mhitauth"] = self.auth_token
             
             # Single API call for all numbers
             resp = self.session.get(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}&mhitauth={self.auth_token}",
+                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
                 headers=headers,
                 timeout=8
             )
@@ -572,7 +576,7 @@ class APIClient:
                 logger.info("Token expired in check_otp_batch, refreshing...")
                 if self.login():
                     resp = self.session.get(
-                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}&mhitauth={self.auth_token}",
+                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
                         headers=headers,
                         timeout=8
                     )
