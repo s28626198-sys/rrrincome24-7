@@ -500,11 +500,23 @@ class APIClient:
                     return None  # Login failed, return None
             
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception as json_error:
+                    logger.error(f"Failed to parse JSON response in check_otp: {json_error}, Response text: {resp.text[:500]}")
+                    return None
+                
+                # Log API response structure for debugging
+                logger.debug(f"check_otp API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                
                 if 'data' in data and data['data'] is not None:
                     data_obj = data['data']
+                    logger.debug(f"check_otp data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
+                    
                     if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
                         numbers = data_obj['num']
+                        logger.debug(f"check_otp found {len(numbers) if isinstance(numbers, list) else 0} numbers in API response")
+                        
                         if isinstance(numbers, list):
                             target_normalized = number.replace('+', '').replace(' ', '').replace('-', '').strip()
                             target_digits = ''.join(filter(str.isdigit, target_normalized))
@@ -520,11 +532,16 @@ class APIClient:
                                     # Last 9 digits match
                                     if len(target_digits) >= 9:
                                         num_digits = ''.join(filter(str.isdigit, num_value))
-                                        if len(num_digits) >= 9 and num_digits[-9:] == target_digits[-9:]:
-                                            return num_data
+                                    if len(num_digits) >= 9 and num_digits[-9:] == target_digits[-9:]:
+                                        return num_data
+                else:
+                    logger.warning(f"API response structure unexpected. data.data: {data.get('data')}")
+            else:
+                logger.warning(f"check_otp API returned status {resp.status_code}, Response: {resp.text[:500]}")
+            
             return None
         except Exception as e:
-            logger.error(f"Error checking OTP: {e}")
+            logger.error(f"Error checking OTP: {e}", exc_info=True)
             return None
     
     def check_otp_batch(self, numbers):
@@ -564,11 +581,23 @@ class APIClient:
             
             result = {}
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception as json_error:
+                    logger.error(f"Failed to parse JSON response: {json_error}, Response text: {resp.text[:500]}")
+                    return {}
+                
+                # Log API response structure for debugging
+                logger.debug(f"API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                
                 if 'data' in data and data['data'] is not None:
                     data_obj = data['data']
+                    logger.debug(f"data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
+                    
                     if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
                         api_numbers = data_obj['num']
+                        logger.debug(f"Found {len(api_numbers) if isinstance(api_numbers, list) else 0} numbers in API response")
+                        
                         if isinstance(api_numbers, list):
                             # Normalize all target numbers - create lookup maps
                             target_exact_match = {}  # exact normalized -> original
@@ -600,9 +629,14 @@ class APIClient:
                                         if original_num not in result:  # Don't overwrite if already found
                                             result[original_num] = num_data
             
+            else:
+                logger.warning(f"API returned status {resp.status_code}, Response: {resp.text[:500]}")
+                if resp.status_code == 401:
+                    logger.warning("Authentication failed - token may be expired")
+            
             return result
         except Exception as e:
-            logger.error(f"Error checking OTP batch: {e}")
+            logger.error(f"Error checking OTP batch: {e}", exc_info=True)
             return {}
 
 # Global API client - single session for all users
