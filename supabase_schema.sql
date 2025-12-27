@@ -23,13 +23,22 @@ CREATE TABLE user_sessions (
     number TEXT,
     monitoring INTEGER DEFAULT 0,
     number_count INTEGER DEFAULT 2,
+    otp_count INTEGER DEFAULT 0,
+    otp_date TEXT,
     last_check TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Used numbers table (to prevent reuse within 24 hours)
+CREATE TABLE used_numbers (
+    number TEXT PRIMARY KEY,
+    used_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Create indexes for better performance
 CREATE INDEX idx_users_status ON users(status);
 CREATE INDEX idx_user_sessions_monitoring ON user_sessions(monitoring);
 CREATE INDEX idx_user_sessions_user_id ON user_sessions(user_id);
+CREATE INDEX idx_used_numbers_used_at ON used_numbers(used_at);
 
 -- Enable Row Level Security (RLS) if needed
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
