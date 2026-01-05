@@ -84,169 +84,156 @@ def init_database():
 init_database()
 
 # Global locks for thread safety
-db_lock = asyncio.Lock()
+db_lock = threading.Lock()
 user_jobs = {}  # Store latest monitoring job per user (older jobs may still run)
 
 # Global API client - single session for all users
 global_api_client = None
-api_lock = asyncio.Lock()
+api_lock = threading.Lock()
 
-async def get_global_api_client():
+def get_global_api_client():
     """Get or create global API client (single session for all users)"""
     global global_api_client
     if global_api_client is None:
         global_api_client = APIClient()
-        if not await global_api_client.login():
+        if not global_api_client.login():
             logger.error("Failed to login to API")
     return global_api_client
 
-async def refresh_global_token():
+def refresh_global_token():
     """Refresh global API token if expired"""
     global global_api_client
-    async with api_lock:
+    with api_lock:
         if global_api_client:
-            if not await global_api_client.login():
+            if not global_api_client.login():
                 logger.error("Failed to refresh API token")
                 # Try to create new client
                 global_api_client = APIClient()
-                await global_api_client.login()
+                global_api_client.login()
         else:
-            await get_global_api_client()
+            get_global_api_client()
 
-async def get_user_status(user_id):
+def get_user_status(user_id):
     """Get user approval status from database"""
     try:
-        async with db_lock:
-            # Use asyncio.to_thread for blocking Supabase calls
-            result = await asyncio.to_thread(
-                lambda: supabase.table('users').select('status').eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            result = supabase.table('users').select('status').eq('user_id', int(user_id)).execute()
             if result.data and len(result.data) > 0:
                 status = result.data[0].get('status')
                 if status:
                     return status
+        # Return 'pending' if user doesn't exist (not None)
         return 'pending'
     except Exception as e:
         logger.error(f"Error getting user status: {e}")
+        # Return 'pending' on error to avoid approval loop
         return 'pending'
 
-async def add_user(user_id, username):
+def add_user(user_id, username):
     """Add new user to database"""
     try:
-        async with db_lock:
-            await asyncio.to_thread(
-                lambda: supabase.table('users').upsert({
-                    'user_id': int(user_id),
-                    'username': username,
-                    'status': 'pending'
-                }).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            supabase.table('users').upsert({
+                'user_id': int(user_id),
+                'username': username,
+                'status': 'pending'
+            }).execute()
     except Exception as e:
         logger.error(f"Error adding user: {e}")
 
-async def approve_user(user_id):
+def approve_user(user_id):
     """Approve user in database"""
     try:
-        async with db_lock:
-            await asyncio.to_thread(
-                lambda: supabase.table('users').update({
-                    'status': 'approved',
-                    'approved_at': datetime.now().isoformat()
-                }).eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            supabase.table('users').update({
+                'status': 'approved',
+                'approved_at': datetime.now().isoformat()
+            }).eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error approving user: {e}")
 
-async def reject_user(user_id):
+def reject_user(user_id):
     """Reject user in database"""
     try:
-        async with db_lock:
-            await asyncio.to_thread(
-                lambda: supabase.table('users').update({
-                    'status': 'rejected'
-                }).eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            supabase.table('users').update({
+                'status': 'rejected'
+            }).eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error rejecting user: {e}")
 
-async def remove_user(user_id):
+def remove_user(user_id):
     """Remove user from database"""
     try:
-        async with db_lock:
-            await asyncio.to_thread(
-                lambda: supabase.table('users').delete().eq('user_id', int(user_id)).execute()
-            )
-            await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').delete().eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            supabase.table('users').delete().eq('user_id', int(user_id)).execute()
+            supabase.table('user_sessions').delete().eq('user_id', int(user_id)).execute()
     except Exception as e:
         logger.error(f"Error removing user: {e}")
 
-async def get_pending_users():
+def get_pending_users():
     """Get list of pending users"""
     try:
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('users').select('user_id, username').eq('status', 'pending').execute()
-            )
+        with db_lock:
+            result = supabase.table('users').select('user_id, username').eq('status', 'pending').execute()
             return [(row['user_id'], row['username']) for row in result.data] if result.data else []
     except Exception as e:
         logger.error(f"Error getting pending users: {e}")
         return []
 
-async def get_all_users():
+def get_all_users():
     """Get all users"""
     try:
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('users').select('user_id, username, status').execute()
-            )
+        with db_lock:
+            result = supabase.table('users').select('user_id, username, status').execute()
             return [(row['user_id'], row['username'], row['status']) for row in result.data] if result.data else []
     except Exception as e:
         logger.error(f"Error getting all users: {e}")
         return []
 
-async def get_approved_user_ids():
+
+def get_approved_user_ids():
     """Get list of approved user_ids."""
     try:
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('users').select('user_id').eq('status', 'approved').execute()
-            )
+        with db_lock:
+            result = supabase.table('users').select('user_id').eq('status', 'approved').execute()
             return [int(row['user_id']) for row in result.data] if result.data else []
     except Exception as e:
         logger.error(f"Error getting approved users: {e}")
         return []
 
-async def update_user_session(user_id, service=None, country=None, range_id=None, number=None, monitoring=0, number_count=None):
+def update_user_session(user_id, service=None, country=None, range_id=None, number=None, monitoring=0, number_count=None):
     """Update user session in database"""
     try:
-        async with db_lock:
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
             data = {
                 'user_id': int(user_id),
+                'selected_service': service,
+                'selected_country': country,
+                'range_id': range_id,
+                'number': number,
                 'monitoring': monitoring,
                 'last_check': datetime.now().isoformat()
             }
-            if service: data['selected_service'] = service
-            if country: data['selected_country'] = country
-            if range_id: data['range_id'] = range_id
-            if number: data['number'] = number
+            # Only update number_count if provided
             if number_count is not None:
                 data['number_count'] = number_count
-                
-            await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').upsert(data).execute()
-            )
+            supabase.table('user_sessions').upsert(data).execute()
     except Exception as e:
         logger.error(f"Error updating user session: {e}")
 
-async def get_user_session(user_id):
+def get_user_session(user_id):
     """Get user session from database"""
     try:
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').select('*').eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            # Use integer user_id (BIGINT in database)
+            result = supabase.table('user_sessions').select('*').eq('user_id', int(user_id)).execute()
             if result.data and len(result.data) > 0:
                 row = result.data[0]
                 return {
@@ -256,15 +243,15 @@ async def get_user_session(user_id):
                     'range_id': row.get('range_id'),
                     'number': row.get('number'),
                     'monitoring': row.get('monitoring', 0),
-                    'number_count': row.get('number_count', 2)
+                    'number_count': row.get('number_count', 2)  # Default to 2 if not set
                 }
-        return {'number_count': 2}
+        return {'number_count': 2}  # Return default if no session exists
     except Exception as e:
         logger.error(f"Error getting user session: {e}")
-        return {'number_count': 2}
+        return {'number_count': 2}  # Return default on error
 
 
-async def add_used_number(number):
+def add_used_number(number):
     """Add a number to the used_numbers table to prevent reuse for 24 hours."""
     try:
         if not number:
@@ -274,19 +261,17 @@ async def add_used_number(number):
         if not normalized:
             return
             
-        async with db_lock:
-            await asyncio.to_thread(
-                lambda: supabase.table('used_numbers').upsert({
-                    'number': normalized,
-                    'used_at': datetime.now(timezone.utc).isoformat()
-                }).execute()
-            )
+        with db_lock:
+            supabase.table('used_numbers').upsert({
+                'number': normalized,
+                'used_at': datetime.now(timezone.utc).isoformat()
+            }).execute()
         logger.info(f"Number {normalized} added to used_numbers table.")
     except Exception as e:
         logger.error(f"Error adding used number {number}: {e}")
 
 
-async def is_number_used(number):
+def is_number_used(number):
     """Check if a number has been used (received OTP) within the last 24 hours."""
     try:
         if not number:
@@ -296,11 +281,9 @@ async def is_number_used(number):
         if not normalized:
             return False
             
-        async with db_lock:
+        with db_lock:
             # Check for exact match
-            result = await asyncio.to_thread(
-                lambda: supabase.table('used_numbers').select('*').eq('number', normalized).execute()
-            )
+            result = supabase.table('used_numbers').select('*').eq('number', normalized).execute()
             if result.data and len(result.data) > 0:
                 used_at_str = result.data[0].get('used_at')
                 if used_at_str:
@@ -314,14 +297,25 @@ async def is_number_used(number):
         return False
 
 
-async def increment_otp_count(user_id):
+def get_bd_today_str():
+    """Return today's date string in Asia/Dhaka timezone (YYYY-MM-DD)."""
+    # Asia/Dhaka is UTC+6 and has no DST currently
+    bd_now = datetime.now(timezone.utc) + timedelta(hours=6)
+    return bd_now.date().isoformat()
+
+
+def get_bd_now():
+    """Return current datetime in Asia/Dhaka timezone (UTC+6)."""
+    # Using fixed offset to avoid extra deps (Asia/Dhaka has no DST currently)
+    return datetime.now(timezone.utc) + timedelta(hours=6)
+
+
+def increment_otp_count(user_id):
     """Increment today's OTP count for a user (per Bangladesh time)."""
     try:
         today_str = get_bd_today_str()
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').select('otp_count, otp_date').eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            result = supabase.table('user_sessions').select('otp_count, otp_date').eq('user_id', int(user_id)).execute()
             otp_count = 0
             otp_date = None
             if result.data and len(result.data) > 0:
@@ -335,25 +329,21 @@ async def increment_otp_count(user_id):
             else:
                 new_count = otp_count + 1
 
-            await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').upsert({
-                    'user_id': int(user_id),
-                    'otp_count': new_count,
-                    'otp_date': today_str
-                }).execute()
-            )
+            supabase.table('user_sessions').upsert({
+                'user_id': int(user_id),
+                'otp_count': new_count,
+                'otp_date': today_str
+            }).execute()
     except Exception as e:
         logger.error(f"Error incrementing OTP count for user {user_id}: {e}")
 
 
-async def get_today_otp_count(user_id):
+def get_today_otp_count(user_id):
     """Get how many OTPs user received today (per Bangladesh time)."""
     try:
         today_str = get_bd_today_str()
-        async with db_lock:
-            result = await asyncio.to_thread(
-                lambda: supabase.table('user_sessions').select('otp_count, otp_date').eq('user_id', int(user_id)).execute()
-            )
+        with db_lock:
+            result = supabase.table('user_sessions').select('otp_count, otp_date').eq('user_id', int(user_id)).execute()
             if result.data and len(result.data) > 0:
                 row = result.data[0]
                 otp_count = row.get('otp_count', 0) or 0
@@ -366,7 +356,7 @@ async def get_today_otp_count(user_id):
         return 0
 
 
-async def resolve_app_id(service_name, context):
+def resolve_app_id(service_name, context):
     """Resolve app_id from known services or per-user custom services."""
     if service_name in SERVICE_APP_IDS:
         return SERVICE_APP_IDS[service_name]
@@ -377,23 +367,19 @@ async def resolve_app_id(service_name, context):
 class APIClient:
     def __init__(self):
         self.base_url = BASE_URL
-        # Use curl_cffi for Cloudflare bypass
+        # Use curl_cffi if available (best for Cloudflare bypass)
         if HAS_CURL_CFFI:
-            self.session = curl_requests.AsyncSession(impersonate="chrome110")
+            self.session = curl_requests.Session(impersonate="chrome110")
             self.use_curl = True
-            logger.info("Using curl_cffi AsyncSession for Cloudflare bypass")
-        else:
-            # Fallback to standard requests (sync) if AsyncSession not available
-            # However, for a truly async bot, we should use httpx or similar if curl_cffi is missing
-            try:
-                import httpx
-                self.session = httpx.AsyncClient()
-                logger.warning("Using httpx for Async API calls")
-            except ImportError:
-                self.session = requests.Session()
-                logger.warning("No Async API client available, using blocking requests")
+            logger.info("Using curl_cffi for Cloudflare bypass")
+        elif HAS_CLOUDSCRAPER:
+            self.session = cloudscraper.create_scraper()
             self.use_curl = False
-            
+            logger.info("Using cloudscraper for Cloudflare bypass")
+        else:
+            self.session = requests.Session()
+            self.use_curl = False
+            logger.warning("No Cloudflare bypass available, using standard requests")
         self.auth_token = None
         self.email = API_EMAIL
         self.password = API_PASSWORD
@@ -411,10 +397,9 @@ class APIClient:
             "Sec-Fetch-Dest": "empty"
         }
     
-    async def login(self):
-        """Login to API - Asynchronus version"""
+    def login(self):
+        """Login to API - EXACT COPY from otp_tool.py"""
         try:
-            logger.info(f"Logging in to API as {self.email}...")
             login_headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
                 "User-Agent": self.browser_headers["User-Agent"],
@@ -422,7 +407,7 @@ class APIClient:
                 "Origin": self.browser_headers["Origin"],
                 "Referer": f"{self.base_url}/auth/login"
             }
-            login_resp = await self.session.post(
+            login_resp = self.session.post(
                 f"{self.base_url}/api/v1/mnitnetworkcom/auth/login",
                 data={"email": self.email, "password": self.password},
                 headers=login_headers,
@@ -432,6 +417,7 @@ class APIClient:
             if login_resp.status_code in [200, 201]:
                 login_data = login_resp.json()
                 
+                # Check if response has expected structure
                 if not login_data or 'data' not in login_data or not login_data.get('data'):
                     logger.error(f"Login response missing data: {login_data}")
                     return False
@@ -445,15 +431,22 @@ class APIClient:
                 # Set session cookie properly
                 self.session.cookies.set('mnitnetworkcom_session', session_token, domain='v2.mnitnetwork.com')
                 
-                hitauth_headers = {
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": self.browser_headers["User-Agent"],
-                    "Accept": self.browser_headers["Accept"],
-                    "Origin": self.browser_headers["Origin"],
-                    "Referer": f"{self.base_url}/dashboard/getnum"
-                }
-
-                hitauth_resp = await self.session.post(
+                # If using curl_cffi, minimal headers needed
+                if self.use_curl:
+                    hitauth_headers = {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Origin": self.browser_headers["Origin"],
+                        "Referer": f"{self.base_url}/dashboard/getnum"
+                    }
+                else:
+                    hitauth_headers = {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": self.browser_headers["User-Agent"],
+                        "Accept": self.browser_headers["Accept"],
+                        "Origin": self.browser_headers["Origin"],
+                        "Referer": f"{self.base_url}/dashboard/getnum"
+                    }
+                hitauth_resp = self.session.post(
                     f"{self.base_url}/api/v1/mnitnetworkcom/auth/hitauth",
                     data={
                         "mnitnetworkcom_session": session_token,
@@ -466,12 +459,21 @@ class APIClient:
                 if hitauth_resp.status_code in [200, 201]:
                     hitauth_data = hitauth_resp.json()
                     
-                    if not hitauth_data or 'data' not in hitauth_data or not hitauth_data.get('data') or 'token' not in hitauth_data['data']:
-                        logger.error(f"Hitauth response invalid: {hitauth_data}")
+                    # Check if hitauth response has expected structure
+                    if not hitauth_data or 'data' not in hitauth_data or not hitauth_data.get('data'):
+                        logger.error(f"Hitauth response missing data: {hitauth_data}")
+                        return False
+                    
+                    if 'token' not in hitauth_data['data']:
+                        logger.error(f"Hitauth response missing token: {hitauth_data}")
                         return False
                     
                     self.auth_token = hitauth_data['data']['token']
+                    
+                    # Set account type cookie
                     self.session.cookies.set('mnitnetworkcom_accountType', 'user', domain='v2.mnitnetwork.com')
+                    
+                    # Store mhitauth token in cookie (browser does this)
                     self.session.cookies.set('mnitnetworkcom_mhitauth', self.auth_token, domain='v2.mnitnetwork.com')
                     
                     logger.info("Login successful")
@@ -487,14 +489,15 @@ class APIClient:
             logger.error(traceback.format_exc())
             return False
     
-    async def get_ranges(self, app_id, max_retries=10):
-        """Get active ranges for an application with retry logic - Async."""
+    def get_ranges(self, app_id, max_retries=10):
+        """Get active ranges for an application with retry logic."""
         attempt = 0
         while attempt < max_retries:
             attempt += 1
             try:
                 if not self.auth_token:
-                    if not await self.login(): return []
+                    if not self.login():
+                        return []
 
                 headers = {
                     "mhitauth": self.auth_token,
@@ -503,18 +506,20 @@ class APIClient:
                 headers["Origin"] = self.base_url
                 headers["Referer"] = f"{self.base_url}/dashboard/getnum"
 
-                resp = await self.session.get(
+                resp = self.session.get(
                     f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=carriers&appId={app_id}",
                     headers=headers,
                     timeout=15
                 )
 
+                # Check if token expired
                 if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
                     logger.info("Token expired, refreshing...")
-                    if await self.login():
-                        resp = await self.session.get(
+                    if self.login():
+                        # Retry request once immediately with refreshed token
+                        resp = self.session.get(
                             f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=carriers&appId={app_id}",
-                            headers={"mhitauth": self.auth_token, **self.browser_headers},
+                            headers=headers,
                             timeout=15
                         )
 
@@ -528,18 +533,19 @@ class APIClient:
                 logger.error(f"Error getting ranges (attempt {attempt}/{max_retries}): {e}")
 
             if attempt < max_retries:
-                await asyncio.sleep(1)
+                time.sleep(1)
 
         return []
 
-    async def get_applications(self, max_retries=5):
-        """Fetch available applications (services) list - Async."""
+    def get_applications(self, max_retries=5):
+        """Fetch available applications (services) list."""
         attempt = 0
         while attempt < max_retries:
             attempt += 1
             try:
                 if not self.auth_token:
-                    if not await self.login(): return []
+                    if not self.login():
+                        return []
 
                 headers = {
                     "mhitauth": self.auth_token,
@@ -548,7 +554,7 @@ class APIClient:
                 headers["Origin"] = self.base_url
                 headers["Referer"] = f"{self.base_url}/dashboard/getnum"
 
-                resp = await self.session.get(
+                resp = self.session.get(
                     f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=applications",
                     headers=headers,
                     timeout=15
@@ -556,10 +562,10 @@ class APIClient:
 
                 if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
                     logger.info("Token expired in get_applications, refreshing...")
-                    if await self.login():
-                        resp = await self.session.get(
+                    if self.login():
+                        resp = self.session.get(
                             f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=applications",
-                            headers={"mhitauth": self.auth_token, **self.browser_headers},
+                            headers=headers,
                             timeout=15
                         )
 
@@ -573,15 +579,16 @@ class APIClient:
                 logger.error(f"Error in get_applications (attempt {attempt}/{max_retries}): {e}")
 
             if attempt < max_retries:
-                await asyncio.sleep(1)
+                time.sleep(1)
 
         return []
     
-    async def get_number(self, range_id):
-        """Request a number from a range - Async"""
+    def get_number(self, range_id):
+        """Request a number from a range"""
         try:
             if not self.auth_token:
-                if not await self.login(): return None
+                if not self.login():
+                    return None
             
             headers = {
                 "Content-Type": "application/x-www-form-urlencoded",
@@ -590,7 +597,7 @@ class APIClient:
             }
             headers["Referer"] = f"{self.base_url}/dashboard/getnum?range={range_id}"
             
-            resp = await self.session.post(
+            resp = self.session.post(
                 f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnum",
                 data={
                     "range": range_id,
@@ -619,84 +626,133 @@ class APIClient:
             logger.error(f"Error getting number: {e}")
             return None
     
-    async def get_multiple_numbers(self, range_id, range_name=None, count=2, max_retries=10):
-        """Request multiple numbers from a range - Async with filtering."""
+    def get_multiple_numbers(self, range_id, range_name=None, count=2, max_retries=10):
+        """Request multiple numbers from a range - with filtering and dual range_id/range_name logic."""
         numbers = []
         total_attempts = 0
-        max_total_attempts = count * 10
+        max_total_attempts = count * 10  # Safety limit
         
         logger.info(f"Requesting {count} numbers from range {range_id} (name: {range_name})")
         
         while len(numbers) < count and total_attempts < max_total_attempts:
             total_attempts += 1
             try:
+                # Try range_name first (like otp_tool.py line 561)
                 number_data = None
                 if range_name:
-                    number_data = await self.get_number(range_name)
+                    number_data = self.get_number(range_name)
+                
+                # If range_name didn't work, try range_id
                 if not number_data:
-                    number_data = await self.get_number(range_id)
+                    number_data = self.get_number(range_id)
                 
                 if number_data:
                     num_val = number_data.get('number') or number_data.get('num')
                     if num_val:
-                        if not await is_number_used(num_val):
+                        # Check if number was used in last 24 hours
+                        if not is_number_used(num_val):
                             numbers.append(number_data)
                             logger.info(f"Added fresh number: {num_val}")
                         else:
-                            logger.info(f"Skipping used number: {num_val}")
+                            logger.info(f"Skipping recently used number: {num_val}")
+                    else:
+                        logger.warning(f"get_number returned data without number field: {number_data}")
                 else:
+                    # No more numbers available from API or temporary error
+                    logger.warning(f"get_number returned None for range {range_id} (attempt {total_attempts})")
+                    # If we already have some numbers, maybe return what we have after a few more tries
                     if len(numbers) > 0 and total_attempts > count + 2:
                         break
-                    await asyncio.sleep(1)
+                    time.sleep(1)
             except Exception as e:
-                logger.error(f"Error in get_multiple_numbers: {e}")
-                await asyncio.sleep(1)
+                logger.error(f"Error in get_multiple_numbers loop: {e}")
+                time.sleep(1)
+        
+        if not numbers:
+            logger.error(f"❌ Failed to get any valid numbers from range {range_id} after {total_attempts} attempts.")
+        else:
+            logger.info(f"✅ Successfully obtained {len(numbers)}/{count} numbers for range {range_id}.")
+            
         return numbers
     
-    async def check_otp(self, number):
-        """Check for OTP on a number - Async version"""
+    def check_otp(self, number):
+        """Check for OTP on a number - optimized for speed"""
         try:
             if not self.auth_token:
-                if not await self.login(): return None
+                if not self.login():
+                    return None
             
             today = datetime.now().strftime("%d_%m_%Y")
             timestamp = int(time.time() * 1000)
             
-            headers = {"mhitauth": self.auth_token, **self.browser_headers}
+            headers = {
+                **{k: v for k, v in self.browser_headers.items() if k not in ["Origin", "Referer", "Content-Type"]}
+            }
+            headers["Origin"] = self.base_url
+            headers["Referer"] = f"{self.base_url}/dashboard/getnum"
+            # API requires mhitauth as header, not query parameter
+            headers["mhitauth"] = self.auth_token
             
-            resp = await self.session.get(
+            # Reduced timeout for faster response
+            resp = self.session.get(
                 f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
                 headers=headers,
-                timeout=8
+                timeout=8  # Reduced from 15 to 8 seconds
             )
             
+            # Check if token expired - only retry once
             if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                if await self.login():
-                    resp = await self.session.get(
+                logger.info("Token expired in check_otp, refreshing...")
+                if self.login():
+                    # Retry request once
+                    resp = self.session.get(
                         f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
-                        headers={"mhitauth": self.auth_token, **self.browser_headers},
+                        headers=headers,
                         timeout=8
                     )
-
+                else:
+                    return None  # Login failed, return None
+            
             if resp.status_code == 200:
-                data = resp.json()
-                if 'data' in data and data['data'] is not None and 'num' in data['data']:
-                    target_normalized = number.replace('+', '').replace(' ', '').replace('-', '').strip()
-                    target_digits = ''.join(filter(str.isdigit, target_normalized))
+                try:
+                    data = resp.json()
+                except Exception as json_error:
+                    logger.error(f"Failed to parse JSON response in check_otp: {json_error}, Response text: {resp.text[:500]}")
+                    return None
+                
+                # Log API response structure for debugging
+                logger.debug(f"check_otp API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                
+                if 'data' in data and data['data'] is not None:
+                    data_obj = data['data']
+                    logger.debug(f"check_otp data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
                     
-                    for num_data in data['data']['num']:
-                        if isinstance(num_data, dict):
-                            num_value = num_data.get('number', '')
-                            num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
-                            if num_normalized == target_normalized:
-                                return num_data
-                            if len(target_digits) >= 9:
-                                num_digits = ''.join(filter(str.isdigit, num_value))
-                                if len(num_digits) >= 9 and num_digits[-9:] == target_digits[-9:]:
-                                    return num_data
-            return None
-        except Exception as e:
-            logger.error(f"Error checking OTP: {e}")
+                    if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
+                        numbers = data_obj['num']
+                        logger.debug(f"check_otp found {len(numbers) if isinstance(numbers, list) else 0} numbers in API response")
+                        
+                        if isinstance(numbers, list):
+                            target_normalized = number.replace('+', '').replace(' ', '').replace('-', '').strip()
+                            target_digits = ''.join(filter(str.isdigit, target_normalized))
+                            
+                            # Optimized search - check exact match and last 9 digits in one pass
+                            for num_data in numbers:
+                                if isinstance(num_data, dict):
+                                    num_value = num_data.get('number', '')
+                                    num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
+                                    # Exact match
+                                    if num_normalized == target_normalized:
+                                        return num_data
+                                    # Last 9 digits match
+                                    if len(target_digits) >= 9:
+                                        num_digits = ''.join(filter(str.isdigit, num_value))
+                                    if len(num_digits) >= 9 and num_digits[-9:] == target_digits[-9:]:
+                                        return num_data
+                else:
+                    logger.warning(f"API response structure unexpected. data.data: {data.get('data')}")
+            else:
+                logger.warning(f"check_otp API returned status {resp.status_code}, Response: {resp.text[:500]}")
+            
             return None
         except Exception as e:
             logger.error(f"Error checking OTP: {e}", exc_info=True)
@@ -747,64 +803,84 @@ class APIClient:
                     logger.error(f"Failed to parse JSON response: {json_error}, Response text: {resp.text[:500]}")
                     return {}
                 
-    async def check_otp_batch(self, numbers):
-        """Check OTP for multiple numbers in one API call - Async version"""
-        try:
-            if not self.auth_token:
-                if not await self.login(): return {}
-            
-            today = datetime.now().strftime("%d_%m_%Y")
-            timestamp = int(time.time() * 1000)
-            
-            headers = {"mhitauth": self.auth_token, **self.browser_headers}
-            
-            resp = await self.session.get(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
-                headers=headers,
-                timeout=8
-            )
-            
-            if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                if await self.login():
-                    resp = await self.session.get(
-                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
-                        headers={"mhitauth": self.auth_token, **self.browser_headers},
-                        timeout=8
-                    )
-
-            result = {}
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'data' in data and data['data'] is not None and 'num' in data['data']:
-                    api_numbers = data['data']['num']
+                # Log API response structure for debugging
+                logger.debug(f"API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+                
+                if 'data' in data and data['data'] is not None:
+                    data_obj = data['data']
+                    logger.debug(f"data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
                     
-                    target_exact_match = {}
-                    target_last9_match = {}
-                    for num in numbers:
-                        normalized = num.replace('+', '').replace(' ', '').replace('-', '').strip()
-                        target_exact_match[normalized] = num
-                        digits = ''.join(filter(str.isdigit, normalized))
-                        if len(digits) >= 9:
-                            target_last9_match[digits[-9:]] = num
-                    
-                    for num_data in api_numbers:
-                        if isinstance(num_data, dict):
-                            num_value = num_data.get('number', '')
-                            num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
-                            num_digits = ''.join(filter(str.isdigit, num_value))
+                    if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
+                        api_numbers = data_obj['num']
+                        logger.debug(f"Found {len(api_numbers) if isinstance(api_numbers, list) else 0} numbers in API response")
+                        
+                        if isinstance(api_numbers, list):
+                            # Normalize all target numbers - create lookup maps
+                            target_exact_match = {}  # exact normalized -> original
+                            target_last9_match = {}  # last 9 digits -> original
                             
-                            if num_normalized in target_exact_match:
-                                original_num = target_exact_match[num_normalized]
-                                if original_num not in result:
-                                    result[original_num] = num_data
-                            elif len(num_digits) >= 9 and num_digits[-9:] in target_last9_match:
-                                original_num = target_last9_match[num_digits[-9:]]
-                                if original_num not in result:
-                                    result[original_num] = num_data
+                            for num in numbers:
+                                normalized = num.replace('+', '').replace(' ', '').replace('-', '').strip()
+                                target_exact_match[normalized] = num
+                                # Also store last 9 digits
+                                digits = ''.join(filter(str.isdigit, normalized))
+                                if len(digits) >= 9:
+                                    target_last9_match[digits[-9:]] = num
+                            
+                            # Match all numbers in one pass
+                            for num_data in api_numbers:
+                                if isinstance(num_data, dict):
+                                    num_value = num_data.get('number', '')
+                                    num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
+                                    num_digits = ''.join(filter(str.isdigit, num_value))
+                                    
+                                    # Check exact match first
+                                    if num_normalized in target_exact_match:
+                                        original_num = target_exact_match[num_normalized]
+                                        if original_num not in result:  # Don't overwrite if already found
+                                            result[original_num] = num_data
+                                    # Check last 9 digits match
+                                    elif len(num_digits) >= 9 and num_digits[-9:] in target_last9_match:
+                                        original_num = target_last9_match[num_digits[-9:]]
+                                        if original_num not in result:  # Don't overwrite if already found
+                                            result[original_num] = num_data
+            
+            else:
+                logger.warning(f"API returned status {resp.status_code}, Response: {resp.text[:500]}")
+                if resp.status_code == 401:
+                    logger.warning("Authentication failed - token may be expired")
+            
             return result
         except Exception as e:
-            logger.error(f"Error checking OTP batch: {e}")
+            logger.error(f"Error checking OTP batch: {e}", exc_info=True)
             return {}
+
+# Global API client - single session for all users
+global_api_client = None
+api_lock = threading.Lock()
+
+def get_global_api_client():
+    """Get or create global API client (single session for all users)"""
+    global global_api_client
+    if global_api_client is None:
+        global_api_client = APIClient()
+        # Try to login, but don't fail if it doesn't work - will retry on first API call
+        if not global_api_client.login():
+            logger.warning("Initial login failed, will retry on first API call")
+    return global_api_client
+
+def refresh_global_token():
+    """Refresh global API token if expired"""
+    global global_api_client
+    with api_lock:
+        if global_api_client:
+            if not global_api_client.login():
+                logger.error("Failed to refresh API token")
+                # Try to create new client
+                global_api_client = APIClient()
+                global_api_client.login()
+        else:
+            get_global_api_client()
 
 # Comprehensive Country calling codes mapping (199+ countries)
 COUNTRY_CODES = {
@@ -1152,9 +1228,10 @@ def detect_language_from_sms(sms_content):
     # Common language indicators
     # NOTE: "code" is too generic (exists in many languages). We prefer longer phrases / accented words.
     language_keywords = {
+        'English': ['your code is', 'verification code', 'otp', 'one-time password', 'do not share', 'verify', 'confirm', 'code is', 'code'],
         'French': ['votre code est', 'vérification', 'vérifier', 'mot de passe', 'confirmer', 'connexion', 'sécurité', 'ne partagez pas'],
         'Spanish': ['tu código es', 'código', 'verificación', 'contraseña', 'confirmar', 'verificar'],
-        'German': ['code', 'bestätigung', 'passwort', 'bestätigen', 'verifizieren', 'ihr code ist'],
+        'German': ['dein code ist', 'ihr code ist', 'bestätigung', 'passwort', 'bestätigen', 'verifizieren'],
         'Italian': ['codice', 'verifica', 'password', 'confermare', 'verificare', 'il tuo codice è'],
         'Portuguese': ['código', 'verificação', 'senha', 'confirmar', 'verificar', 'seu código é'],
         'Russian': ['код', 'подтверждение', 'пароль', 'подтвердить', 'проверить', 'ваш код'],
@@ -1165,7 +1242,7 @@ def detect_language_from_sms(sms_content):
         'Japanese': ['コード', '確認', 'パスワード', '確認する', '検証', 'あなたのコードは'],
         'Korean': ['코드', '확인', '비밀번호', '확인하다', '검증', '귀하의 코드는'],
         'Turkish': ['kod', 'doğrulama', 'şifre', 'onayla', 'doğrula', 'kodunuz'],
-        'Dutch': ['code', 'verificatie', 'wachtwoord', 'bevestigen', 'verifiëren', 'uw code is'],
+        'Dutch': ['uw code is', 'verificatie', 'wachtwoord', 'bevestigen', 'verifiëren'],
         'Polish': ['kod', 'weryfikacja', 'hasło', 'potwierdź', 'zweryfikuj', 'twój kod to'],
         'Thai': ['รหัส', 'การยืนยัน', 'รหัสผ่าน', 'ยืนยัน', 'ตรวจสอบ', 'รหัสของคุณคือ'],
         'Vietnamese': ['mã', 'xác minh', 'mật khẩu', 'xác nhận', 'xác minh', 'mã của bạn là'],
@@ -1322,18 +1399,13 @@ def detect_language_from_sms(sms_content):
         if score > 0:
             scores[lang] = score
 
-    # If no strong non-English match, fall back to English heuristics
-    if not scores:
-        english_keywords = ['verification', 'otp', 'password', 'confirm', 'verify', 'your code is', 'use this code']
-        for kw in english_keywords:
-            if kw in sms_lower:
-                return 'English'
-        # As absolute fallback, English
-        return 'English'
+    # Pick best scoring language (if any)
+    if scores:
+        best_lang = max(scores.items(), key=lambda kv: kv[1])[0]
+        return best_lang
 
-    # Pick best scoring language
-    best_lang = max(scores.items(), key=lambda kv: kv[1])[0]
-    return best_lang
+    # Default fallback
+    return 'English'
 
 # Bot Handlers
 async def rangechkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1519,7 +1591,7 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        approved_user_ids = await get_approved_user_ids()
+        approved_user_ids = get_approved_user_ids()
         if not approved_user_ids:
             await update.message.reply_text("ℹ️ No approved users found to broadcast to.")
             return
@@ -1570,7 +1642,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if data.startswith("admin_approve_"):
             target_user_id = int(data.split("_")[2])
-            await approve_user(target_user_id)
+            approve_user(target_user_id)
             await query.edit_message_text(f"✅ User {target_user_id} approved.")
             try:
                 await context.bot.send_message(
@@ -1582,7 +1654,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         elif data.startswith("admin_reject_"):
             target_user_id = int(data.split("_")[2])
-            await reject_user(target_user_id)
+            reject_user(target_user_id)
             await query.edit_message_text(f"❌ User {target_user_id} rejected.")
             try:
                 await context.bot.send_message(
@@ -1594,7 +1666,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Check if user is approved
-    status = await get_user_status(user_id)
+    status = get_user_status(user_id)
     if status != 'approved':
         await query.edit_message_text("❌ Your access is pending approval.")
         return
@@ -1608,7 +1680,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Update user session with new count
-            await update_user_session(user_id, number_count=count)
+            update_user_session(user_id, number_count=count)
             
             await query.edit_message_text(
                 f"✅ Number count set to {count}.\n\n"
@@ -1621,8 +1693,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Service selection (from inline buttons)
     if data.startswith("service_"):
+        service_name = data.split("_")[1]
+        
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
@@ -1630,7 +1704,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # If Others clicked, first show dynamic service list (excluding WhatsApp/Facebook)
         if service_name == "others":
             try:
-                apps = await api_client.get_applications()
+                with api_lock:
+                    apps = api_client.get_applications()
                 if not apps:
                     await query.edit_message_text("❌ No services found.")
                     return
@@ -1663,12 +1738,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # For primary services (WhatsApp/Facebook)
-        app_id = await resolve_app_id(service_name, context)
+        app_id = resolve_app_id(service_name, context)
         if not app_id:
             await query.edit_message_text("❌ Invalid service.")
             return
         
-        ranges = await api_client.get_ranges(app_id)
+        with api_lock:
+            ranges = api_client.get_ranges(app_id)
         
         if not ranges:
             await query.edit_message_text(f"❌ No active ranges available for {service_name}.")
@@ -1746,12 +1822,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['custom_services'][service_key] = app_id
 
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
 
-        ranges = await api_client.get_ranges(app_id)
+        with api_lock:
+            ranges = api_client.get_ranges(app_id)
 
         if not ranges:
             await query.edit_message_text(f"❌ No active ranges available for {service_label}.")
@@ -1776,9 +1853,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Try to extract from range name more aggressively
                 range_str = str(range_name).upper()
                 # Sometimes range name contains country code in different format
-                for code, country_name in COUNTRY_CODES.items():
-                    if code in range_str or country_name.upper() in range_str:
-                        country = country_name
+                for code, c_name in COUNTRY_CODES.items():
+                    if code in range_str or c_name.upper() in range_str:
+                        country = c_name
                         break
             
             # Final fallback - use detected or keep as Unknown
@@ -1828,18 +1905,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         service_name = parts[1]
         country = parts[2]
         
-        app_id = await resolve_app_id(service_name, context)
+        app_id = resolve_app_id(service_name, context)
         if not app_id:
             await query.edit_message_text("❌ Invalid service.")
             return
         
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
         
-        ranges = await api_client.get_ranges(app_id)
+        with api_lock:
+            ranges = api_client.get_ranges(app_id)
         
         # Find ranges for this country - collect all matching ranges first
         # Match by detecting country from range name, not just API country field
@@ -1849,23 +1927,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r_country_api = r.get('cantryName', r.get('country', ''))
             is_match = False
             
-            # Try API country first (case-insensitive)
+            # Hybrid approach: validate API country against range name to prevent API-side errors
+            # This ensures we don't show Ivory Coast (225) numbers when user selects Cameroon
             if r_country_api and r_country_api.lower() == country.lower():
-                is_match = True
-            
-            # Detect country from range name
-            if not is_match:
+                # API says this is the right country, but verify with range name
+                r_country_detected = detect_country_from_range(range_name)
+                logger.info(f"Range {range_name}: API says '{r_country_api}', detected from name: '{r_country_detected}', looking for: '{country}'")
+                if r_country_detected:
+                    # If range name suggests a different country, skip this range
+                    if r_country_detected.lower() == country.lower():
+                        is_match = True
+                        logger.info(f"✓ Range {range_name} MATCHED (both API and name agree on {country})")
+                    else:
+                        logger.info(f"✗ Range {range_name} SKIPPED (API says {r_country_api} but name suggests {r_country_detected})")
+                else:
+                    # Can't detect from range name, trust API
+                    is_match = True
+                    logger.info(f"✓ Range {range_name} MATCHED (trusting API {r_country_api}, can't detect from name)")
+            # Fallback: if API provides no country info, use range name detection
+            elif not r_country_api or r_country_api.strip() == '' or r_country_api == 'Unknown':
                 r_country_detected = detect_country_from_range(range_name)
                 if r_country_detected and r_country_detected.lower() == country.lower():
                     is_match = True
-            
-            # Also try more aggressive detection if needed
-            if not is_match:
-                range_str = str(range_name).upper()
-                for code, country_name in COUNTRY_CODES.items():
-                    if code in range_str and country_name.lower() == country.lower():
-                        is_match = True
-                        break
+                    logger.info(f"✓ Range {range_name} MATCHED (no API country, detected {r_country_detected})")
+                # Also try more aggressive detection if needed
+                # Aggressive detection removed to prevent false positives (e.g., matching 244 in 232...)
+                pass
             
             if is_match:
                 matching_ranges.append(r)
@@ -1895,11 +1982,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def fetch_and_send_numbers():
             try:
                 # Get user's number count preference
-                session = await get_user_session(user_id)
+                session = get_user_session(user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
-                # Request multiple numbers (pre-filtered by get_multiple_numbers)
-                numbers_data = await api_client.get_multiple_numbers(range_id, range_name, number_count)
+                with api_lock:
+                    # Try range_name first, then range_id (like otp_tool.py)
+                    numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -1931,7 +2019,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Store all numbers in session (comma-separated)
                 numbers_str = ','.join(numbers_list)
-                await update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
+                update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
                 
                 # Start monitoring all numbers in background
                 job = context.job_queue.run_repeating(
@@ -1939,7 +2027,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     interval=3,  # Increased to 3 seconds to prevent overlap
                     first=3,
                     chat_id=user_id,
-                    data={'numbers': numbers_list, 'user_id': user_id, 'country': country, 'service': service_name, 'start_time': time.time()}
+                    data={'numbers': numbers_list, 'user_id': user_id, 'country': country, 'service': service_name, 'start_time': time.time(), 'message_id': query.message.message_id}
                 )
                 user_jobs[user_id] = job  # Store job reference
                 
@@ -2008,13 +2096,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx < 0 or idx >= len(other_apps):
             await query.edit_message_text("❌ Invalid service.")
             return
-            
         service_app = other_apps[idx]
         service_name = service_app.get('id')
         service_label = service_app.get('name', service_name)
         
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
@@ -2022,7 +2109,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Loading ranges for {service_label}...")
         
         try:
-            ranges = await api_client.get_ranges(service_name)
+            with api_lock:
+                ranges = api_client.get_ranges(service_name)
             
             if not ranges or len(ranges) == 0:
                 await query.edit_message_text(f"❌ No ranges found for {service_label}.")
@@ -2031,13 +2119,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error fetching ranges for {service_label}: {e}")
             await query.edit_message_text(f"❌ Failed to load ranges for {service_label}.")
             return
-
     # Range checker service selection
     elif data.startswith("rangechkr_service_"):
         service_name = data.split("_")[2]
         
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
@@ -2048,7 +2135,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Handle "others" - first show dynamic service list
             if service_name == "others":
                 try:
-                    apps = await api_client.get_applications()
+                    with api_lock:
+                        apps = api_client.get_applications()
                     if not apps:
                         await query.edit_message_text("❌ No services found.")
                         return
@@ -2080,12 +2168,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             else:
                 # Handle specific services (WhatsApp, Facebook)
-                app_id = await resolve_app_id(service_name, context)
+                app_id = resolve_app_id(service_name, context)
                 if not app_id:
                     await query.edit_message_text("❌ Invalid service.")
                     return
 
-                ranges = await api_client.get_ranges(app_id)
+                with api_lock:
+                    ranges = api_client.get_ranges(app_id)
 
                 if not ranges or len(ranges) == 0:
                     await query.edit_message_text(f"❌ No ranges found for {service_name.upper()}.")
@@ -2189,7 +2278,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def fetch_and_send_range_numbers():
             try:
                 logger.info(f"Fetching numbers for range_id: {range_id}")
-                api_client = await get_global_api_client()
+                api_client = get_global_api_client()
                 if not api_client:
                     logger.error("API client not available")
                     await context.bot.edit_message_text(
@@ -2200,13 +2289,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 # Get user's number count preference
-                session = await get_user_session(user_id)
+                session = get_user_session(user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
-                # Request multiple numbers (pre-filtered by get_multiple_numbers)
-                logger.info(f"Calling get_multiple_numbers with range_name={range_name}, range_id={range_id}, count={number_count}")
-                numbers_data = await api_client.get_multiple_numbers(range_id, range_name, number_count)
-                logger.info(f"get_multiple_numbers returned: {numbers_data}")
+                with api_lock:
+                    logger.info(f"Calling get_multiple_numbers with range_name={range_name}, range_id={range_id}, count={number_count}")
+                    # Try range_name first, then range_id (like otp_tool.py)
+                    numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+                    logger.info(f"get_multiple_numbers returned: {numbers_data}")
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -2238,7 +2328,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 # Get service info
-                app_id = await resolve_app_id(service_name, context)
+                app_id = resolve_app_id(service_name, context)
                 if not app_id:
                     logger.error(f"Invalid service_name in range selection: {service_name}")
                     await context.bot.edit_message_text(
@@ -2303,7 +2393,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 # Store numbers and start monitoring
-                await update_user_session(user_id, service=service_name, range_id=range_id, number=','.join(numbers_list), monitoring=1)
+                update_user_session(user_id, service=service_name, range_id=range_id, number=','.join(numbers_list), monitoring=1)
                 
                 # Start OTP monitoring job
                 if user_id in user_jobs:
@@ -2400,7 +2490,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle "Set Number Count" button
     if text in ("Set Number Count", "🧮 Set Number Count"):
         # Get current count
-        session = await get_user_session(user_id)
+        session = get_user_session(user_id)
         current_count = session.get('number_count', 2) if session else 2
         
         keyboard = [
@@ -2420,7 +2510,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle "My Stats" button
     if text in ("My Stats", "📊 My Stats"):
-        today_count = await get_today_otp_count(user_id)
+        today_count = get_today_otp_count(user_id)
         bd_now = get_bd_now()
         await update.message.reply_text(
             "📊 My Stats\n\n"
@@ -2451,7 +2541,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         try:
-            ranges = await api_client.get_ranges(app_id)
+            with api_lock:
+                ranges = api_client.get_ranges(app_id)
             
             if not ranges:
                 await update.message.reply_text(f"❌ No active ranges available for {service_name}.")
@@ -2543,7 +2634,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             for service_name, app_id in service_map.items():
-                ranges = await api_client.get_ranges(app_id)
+                with api_lock:
+                    ranges = api_client.get_ranges(app_id)
                 
                 # Search for matching range
                 for r in ranges:
@@ -2575,8 +2667,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session = get_user_session(user_id)
             number_count = session.get('number_count', 2) if session else 2
             
-            # Request numbers (pre-filtered by get_multiple_numbers)
-            numbers_data = await api_client.get_multiple_numbers(range_id, range_name, number_count)
+            with api_lock:
+                # Try range_name first, then range_id (like otp_tool.py)
+                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
             
             if not numbers_data or len(numbers_data) == 0:
                 await update.message.reply_text("❌ Failed to get numbers from this range. Please try again.")
@@ -2641,13 +2734,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_text += f"✅ {len(numbers_list)} numbers received:\n\n"
             message_text += "Tap a number to copy it."
             
-            await update.message.reply_text(
+            sent_msg = await update.message.reply_text(
                 message_text,
                 reply_markup=reply_markup
             )
             
             # Store numbers and start monitoring
-            await update_user_session(user_id, service=found_service, range_id=range_id, number=','.join(numbers_list), monitoring=1)
+            update_user_session(user_id, service=found_service, range_id=range_id, number=','.join(numbers_list), monitoring=1)
             
             # Start OTP monitoring job
             if user_id in user_jobs:
@@ -2662,7 +2755,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'numbers': numbers_list,
                 'service': found_service,
                 'range_id': range_id,
-                'start_time': start_time_value
+                'start_time': start_time_value,
+                'message_id': sent_msg.message_id
             }
             if country_name:
                 job_data['country'] = country_name
@@ -2702,21 +2796,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         country = re.sub(r'^[🇦-🇿\s]+', '', text).strip()
         
         # Get service from user session
-        session = await get_user_session(user_id)
+        session = get_user_session(user_id)
         service_name = session.get('service') if session else None
         
         if not service_name:
             # Try to detect - for now default to whatsapp
             service_name = "whatsapp"
         
+        app_id = resolve_app_id(service_name, context)
+        
         # Get global API client
-        api_client = await get_global_api_client()
+        api_client = get_global_api_client()
         if not api_client:
             await update.message.reply_text("❌ API connection error. Please try again.")
             return
         
         try:
-            ranges = await api_client.get_ranges(app_id)
+            with api_lock:
+                ranges = api_client.get_ranges(app_id)
             
             # Find ranges for this country - collect all matching ranges first
             # Match by detecting country from range name, not just API country field
@@ -2759,15 +2856,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             range_id = selected_range.get('name', selected_range.get('id', ''))
+            range_name = selected_range.get('name', '')
+            
             # Get user's number count preference
-            session = await get_user_session(user_id)
+            session = get_user_session(user_id)
             number_count = session.get('number_count', 2) if session else 2
             
             # Request numbers
             await update.message.reply_text(f"⏳ Requesting {number_count} number(s)...")
             
-            # Request numbers (pre-filtered by get_multiple_numbers)
-            numbers_data = await api_client.get_multiple_numbers(range_id, range_name, number_count)
+            with api_lock:
+                # Try range_name first, then range_id (like otp_tool.py)
+                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
             
             if not numbers_data or len(numbers_data) == 0:
                 await update.message.reply_text("❌ Failed to get numbers. Please try again.")
@@ -2791,7 +2891,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Store all numbers in session (comma-separated)
             numbers_str = ','.join(numbers_list)
-            await update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
+            update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
             
             # Start monitoring all numbers in background
             job = context.job_queue.run_repeating(
@@ -2799,7 +2899,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 interval=2,
                 first=2,
                 chat_id=user_id,
-                data={'numbers': numbers_list, 'user_id': user_id, 'country': country, 'service': service_name, 'start_time': time.time()}
+                data={'numbers': numbers_list, 'user_id': user_id, 'country': country, 'service': service_name, 'start_time': time.time(), 'message_id': sent_msg.message_id}
             )
             user_jobs[user_id] = job
             
@@ -2836,7 +2936,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message += f"Service: {service_icon} {service_name.capitalize()}\n"
             message += f"Waiting for OTP...... ⏳"
             
-            await update.message.reply_text(
+            sent_msg = await update.message.reply_text(
                 message,
                 reply_markup=reply_markup,
                 parse_mode='HTML'
@@ -2852,6 +2952,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
     # Get user_id from job_data first (always set), fallback to job.chat_id
     user_id = job_data.get('user_id') or job.chat_id
     start_time = job_data.get('start_time', time.time())
+    message_id = job_data.get('message_id')  # Get message_id for editing
     
     # Validate user_id
     if not user_id:
@@ -2874,19 +2975,27 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
         if user_id in user_jobs:
             del user_jobs[user_id]
-        await update_user_session(user_id, monitoring=0)
+        update_user_session(user_id, monitoring=0)
         try:
-            numbers_str = ', '.join(numbers)
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⏱️ Timeout! No OTP received for numbers within 15 minutes."
-            )
-        except:
-            pass
+            # Edit the existing message instead of sending a new one
+            if message_id:
+                await context.bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=message_id,
+                    text=f"⏱️ Timeout! No OTP received within 15 minutes."
+                )
+            else:
+                # Fallback to sending new message if message_id not available
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⏱️ Timeout! No OTP received within 15 minutes."
+                )
+        except Exception as e:
+            logger.error(f"Error updating timeout message: {e}")
         return
     
     # Get global API client
-    api_client = await get_global_api_client()
+    api_client = get_global_api_client()
     if not api_client:
         return
     
@@ -2894,7 +3003,8 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         # Check OTP for all numbers in one batch call - much faster (no lag)
         # Use timeout to prevent hanging
         try:
-            otp_results = await api_client.check_otp_batch(numbers)
+            with api_lock:
+                otp_results = api_client.check_otp_batch(numbers)
         except Exception as api_error:
             logger.error(f"API error in check_otp_batch: {api_error}")
             return  # Skip this check, will retry next interval
@@ -2986,10 +3096,10 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                     job_data['received_otps'] = received_otps  # Update job data
                     
                     # Record this number as used (no reuse for 24 hours)
-                    await add_used_number(number)
+                    add_used_number(number)
                     
                     # Get country and service info from job data (most reliable) or session
-                    session = await get_user_session(user_id)
+                    session = get_user_session(user_id)
                     
                     # Try to get country from job data first (most reliable), then session
                     country = job_data.get('country') if job_data else None
@@ -3072,7 +3182,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         logger.warning(f"⚠️ OTP sent to channel but NOT to user {user_id} for {number}: {otp}")
                     
                     # Increment per-day OTP counter (BD time)
-                    await increment_otp_count(user_id)
+                    increment_otp_count(user_id)
 
                     # Check if all numbers have received OTP
                     all_received = all(num in received_otps for num in numbers)
@@ -3082,7 +3192,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         job.schedule_removal()
                         if user_id in user_jobs:
                             del user_jobs[user_id]
-                        await update_user_session(user_id, monitoring=0)
+                        update_user_session(user_id, monitoring=0)
                         return
                     # Otherwise, continue monitoring for remaining numbers
     except Exception as e:

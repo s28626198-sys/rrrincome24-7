@@ -4,6 +4,7 @@
 -- Drop existing tables if they exist (to recreate with correct schema)
 DROP TABLE IF EXISTS user_sessions CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
+DROP TABLE IF EXISTS used_numbers CASCADE;
 
 -- Users table
 CREATE TABLE users (
@@ -43,8 +44,9 @@ CREATE INDEX idx_used_numbers_used_at ON used_numbers(used_at);
 -- Enable Row Level Security (RLS) if needed
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE user_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE used_numbers ENABLE ROW LEVEL SECURITY;
 
 -- Create policies to allow all operations (adjust as needed for security)
 CREATE POLICY "Allow all operations on users" ON users FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all operations on user_sessions" ON user_sessions FOR ALL USING (true) WITH CHECK (true);
-
+CREATE POLICY "Allow all operations on used_numbers" ON used_numbers FOR ALL USING (true) WITH CHECK (true);
