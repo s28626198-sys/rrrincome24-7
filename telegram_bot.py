@@ -2,6 +2,8 @@ import os
 import threading
 import time
 import asyncio
+import concurrent.futures
+from datetime import datetime, timedelta, timezone
 from datetime import datetime, timedelta, timezone
 import requests
 import json
@@ -54,9 +56,9 @@ ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "7325836764"))
 OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1002724043027"))  # Channel ID for forwarding OTP messages
 
 # API Configuration (from otp_tool.py)
-BASE_URL = "https://v2.mnitnetwork.com"
+BASE_URL = "https://stexsms.com"
 API_EMAIL = os.getenv("API_EMAIL", "roni791158@gmail.com")
-API_PASSWORD = os.getenv("API_PASSWORD", "47611858@Dove")
+API_PASSWORD = os.getenv("API_PASSWORD", "53561106@Roni")
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://sgnnqvfoajqsfdyulolm.supabase.co")
@@ -67,8 +69,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Service → appId mapping (known primary services)
 SERVICE_APP_IDS = {
-    "whatsapp": "verifyed-access-whatsapp",
-    "facebook": "verifyed-access-facebook",
+    "whatsapp": "WhatsApp",
+    "facebook": "Facebook",
 }
 
 def init_database():
@@ -138,7 +140,7 @@ def add_user(user_id, username):
             supabase.table('users').upsert({
                 'user_id': int(user_id),
                 'username': username,
-                'status': 'pending'
+                'status': 'approved'
             }).execute()
     except Exception as e:
         logger.error(f"Error adding user: {e}")
@@ -396,192 +398,242 @@ class APIClient:
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Dest": "empty"
         }
+        self._ranges_cache = {}  # Cache structure: {app_id: {'timestamp': time.time(), 'data': [...]}}
+        self._cache_duration = 300  # 5 minutes cache
+        
+        # Internal lock for thread safety (login/token refresh)
+        self._lock = threading.Lock()
     
     def login(self):
-        """Login to API - EXACT COPY from otp_tool.py"""
+        """Login to API - Thread-safe"""
+        # Ensure only one thread performs login at a time
+        with self._lock:
+            # Double-check if another thread already logged in successfully
+            if self.auth_token:
+                # We could test validity here, but simplified to just return True if recently updated?
+                # For now, let's allow re-login to be safe, but only one at a time.
+                pass
+
+            try:
+                login_headers = {
+                    **self.browser_headers,
+                    "Referer": f"{self.base_url}/mdashboard/access"
+                }
+                # Hypothesized login endpoint
+                login_url = f"{self.base_url}/mapi/v1/mauth/login"
+                
+                logger.info(f"Attempting login to {login_url}")
+                login_resp = self.session.post(
+                    login_url,
+                    json={"email": self.email, "password": self.password},
+                    headers=login_headers,
+                    timeout=15
+                )
+                
+                if login_resp.status_code in [200, 201]:
+                    login_data = login_resp.json()
+                    
+                    # Check for token in response
+                    token = None
+                    if 'data' in login_data and 'token' in login_data['data']:
+                        token = login_data['data']['token']
+                    elif 'token' in login_data:
+                        token = login_data['token']
+                    elif 'meta' in login_data and 'token' in login_data['meta']:
+                        token = login_data['meta']['token']
+                    
+                    if token:
+                        self.auth_token = token
+                        self.session.headers.update({"mauthtoken": self.auth_token})
+                        logger.info("Login successful")
+                        return True
+                    else:
+                        logger.error(f"Login response missing token: {login_data}")
+                else:
+                    logger.error(f"Login failed with status {login_resp.status_code}: {login_resp.text[:200]}")
+                    if login_resp.status_code == 404:
+                         logger.error("Login endpoint not found. Please check API documentation or provide a HAR with login.")
+
+                return False
+            except Exception as e:
+                logger.error(f"Login error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return False
+    
+    def _fetch_ranges_with_keyword(self, app_id, keyword, use_origin=True, prefix=""):
+        """Helper to fetch ranges with a specific keyword"""
         try:
-            login_headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "User-Agent": self.browser_headers["User-Agent"],
-                "Accept": self.browser_headers["Accept"],
-                "Origin": self.browser_headers["Origin"],
-                "Referer": f"{self.base_url}/auth/login"
+            if not self.auth_token:
+                return []
+            
+            headers = {
+                **self.browser_headers,
+                "mauthtoken": self.auth_token,
+                "Referer": f"{self.base_url}/mdashboard/access"
             }
-            login_resp = self.session.post(
-                f"{self.base_url}/api/v1/mnitnetworkcom/auth/login",
-                data={"email": self.email, "password": self.password},
-                headers=login_headers,
+            
+            # Build payload based on whether to use origin filter
+            payload = {
+                "prefix": prefix,
+                "keyword": keyword
+            }
+            
+            # Only add origin if use_origin is True (for WhatsApp/Facebook)
+            if use_origin:
+                payload["origin"] = app_id
+            else:
+                payload["origin"] = ""  # Blank for Others
+            
+            resp = self.session.post(
+                f"{self.base_url}/mapi/v1/mdashboard/access/info",
+                json=payload,
+                headers=headers,
                 timeout=15
             )
             
-            if login_resp.status_code in [200, 201]:
-                login_data = login_resp.json()
-                
-                # Check if response has expected structure
-                if not login_data or 'data' not in login_data or not login_data.get('data'):
-                    logger.error(f"Login response missing data: {login_data}")
-                    return False
-                
-                if 'user' not in login_data['data'] or 'session' not in login_data['data']['user']:
-                    logger.error(f"Login response missing user session: {login_data}")
-                    return False
-                
-                session_token = login_data['data']['user']['session']
-                
-                # Set session cookie properly
-                self.session.cookies.set('mnitnetworkcom_session', session_token, domain='v2.mnitnetwork.com')
-                
-                # If using curl_cffi, minimal headers needed
-                if self.use_curl:
-                    hitauth_headers = {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Origin": self.browser_headers["Origin"],
-                        "Referer": f"{self.base_url}/dashboard/getnum"
-                    }
-                else:
-                    hitauth_headers = {
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "User-Agent": self.browser_headers["User-Agent"],
-                        "Accept": self.browser_headers["Accept"],
-                        "Origin": self.browser_headers["Origin"],
-                        "Referer": f"{self.base_url}/dashboard/getnum"
-                    }
-                hitauth_resp = self.session.post(
-                    f"{self.base_url}/api/v1/mnitnetworkcom/auth/hitauth",
-                    data={
-                        "mnitnetworkcom_session": session_token,
-                        "mnitnetworkcom_url": f"{self.base_url}/dashboard/index"
-                    },
-                    headers=hitauth_headers,
-                    timeout=15
-                )
-                
-                if hitauth_resp.status_code in [200, 201]:
-                    hitauth_data = hitauth_resp.json()
-                    
-                    # Check if hitauth response has expected structure
-                    if not hitauth_data or 'data' not in hitauth_data or not hitauth_data.get('data'):
-                        logger.error(f"Hitauth response missing data: {hitauth_data}")
-                        return False
-                    
-                    if 'token' not in hitauth_data['data']:
-                        logger.error(f"Hitauth response missing token: {hitauth_data}")
-                        return False
-                    
-                    self.auth_token = hitauth_data['data']['token']
-                    
-                    # Set account type cookie
-                    self.session.cookies.set('mnitnetworkcom_accountType', 'user', domain='v2.mnitnetwork.com')
-                    
-                    # Store mhitauth token in cookie (browser does this)
-                    self.session.cookies.set('mnitnetworkcom_mhitauth', self.auth_token, domain='v2.mnitnetwork.com')
-                    
-                    logger.info("Login successful")
-                    return True
-                else:
-                    logger.error(f"Hitauth failed with status {hitauth_resp.status_code}: {hitauth_resp.text[:200]}")
-            else:
-                logger.error(f"Login failed with status {login_resp.status_code}: {login_resp.text[:200]}")
-            return False
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
+                    ranges = []
+                    for item in data['data']:
+                        destination = item.get('destination', 'Unknown')
+                        country = destination.split('-')[0].strip() if '-' in destination else destination
+                        
+                        range_val = item.get('test_number')
+                        if range_val:
+                            range_obj = {
+                                'id': range_val,
+                                'range_id': str(item.get('id')),
+                                'name': range_val,
+                                'country': country,
+                                'cantryName': country,
+                                'operator': destination,
+                                'limit_day': item.get('limit_day'),
+                                'limit_hour': item.get('limit_hour')
+                            }
+                            
+                            # For Others service, include the actual service name from API
+                            if not use_origin:
+                                service_name = item.get('origin', 'Unknown')
+                                range_obj['service'] = service_name
+                                # Append service to operator for display
+                                range_obj['operator'] = f"{destination} ({service_name})"
+                            
+                            ranges.append(range_obj)
+                    return ranges
+            return []
         except Exception as e:
-            logger.error(f"Login error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False
-    
-    def get_ranges(self, app_id, max_retries=10):
-        """Get active ranges for an application with retry logic."""
-        attempt = 0
-        while attempt < max_retries:
-            attempt += 1
-            try:
-                if not self.auth_token:
-                    if not self.login():
-                        return []
+            logger.warning(f"Error fetching with keyword '{keyword}': {e}")
+            return []
 
-                headers = {
-                    "mhitauth": self.auth_token,
-                    **{k: v for k, v in self.browser_headers.items() if k not in ["Origin", "Referer", "Content-Type"]}
-                }
-                headers["Origin"] = self.base_url
-                headers["Referer"] = f"{self.base_url}/dashboard/getnum"
+    def get_ranges(self, app_id, max_retries=3, keyword=""):
+        """Get ranges for application - Service-specific keyword strategy"""
+        try:
+            if not self.auth_token:
+                if not self.login():
+                    return []
+            
+            # Check cache first
+            cache_key = f"{app_id}_multi"
+            if cache_key in self._ranges_cache:
+                entry = self._ranges_cache[cache_key]
+                if time.time() - entry['timestamp'] < self._cache_duration:
+                    logger.info(f"Returning cached ranges for {app_id}")
+                    return entry['data']
+            
+            # Determine if this is WhatsApp/Facebook or Others
+            is_specific_service = app_id.lower() in ['whatsapp', 'facebook']
+            
+            # Keywords for WhatsApp/Facebook (with origin filter)
+            specific_keywords = [
+                app_id,           # Service name itself
+                "code",           # Verification code
+                "whatsapp",       # WhatsApp specific
+                "business",       # Business accounts
+                "otp",            # One-time password
+                "verify",         # Verification
+                "authentication", # Auth messages
+                "login",          # Login codes
+                "sms",            # SMS messages
+                "",               # Empty for general
+            ]
+            
+            # Keywords for Others (no origin filter - broader search)
+            others_keywords = [
+                "code",           # Verification code
+                "otp",            # One-time password
+                "verify",         # Verification
+                "authentication", # Auth messages
+                "sms",            # SMS messages
+                "message",        # General messages
+                "notification",   # Notifications
+                "",               # Empty for general
+            ]
+            
+            # Select keywords and origin usage based on service type
+            if is_specific_service:
+                keywords = specific_keywords
+                use_origin = True
+            else:
+                keywords = others_keywords
+                use_origin = False
+            
+            all_ranges = []
+            unique_range_names = set()  # Use range name (phone number) for deduplication, not range_id
+            
+            for kw in keywords:
+                ranges = self._fetch_ranges_with_keyword(app_id, kw, use_origin)
+                
+                # Add only unique ranges (by range name/phone number pattern)
+                for r in ranges:
+                    range_name = r['name']  # e.g., "37525XXXX"
+                    if range_name not in unique_range_names:
+                        unique_range_names.add(range_name)
+                        all_ranges.append(r)
+            
+            # Extra searches for specific WhatsApp prefixes
+            if is_specific_service and 'whatsapp' in app_id.lower():
+                prefixes = ["225", "228", "229", "232", "236", "237", "244", "977"]
+                logger.info(f"Fetching extra ranges for WhatsApp prefixes: {prefixes}")
+                for pfx in prefixes:
+                    ranges = self._fetch_ranges_with_keyword(app_id, "", use_origin, prefix=pfx)
+                    count = 0
+                    for r in ranges:
+                        range_name = r['name']
+                        if range_name not in unique_range_names:
+                            unique_range_names.add(range_name)
+                            all_ranges.append(r)
+                            count += 1
+                    if count > 0:
+                         logger.info(f"Prefix {pfx}: Found {count} new ranges")
 
-                resp = self.session.get(
-                    f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=carriers&appId={app_id}",
-                    headers=headers,
-                    timeout=15
-                )
+            logger.info(f"Found {len(all_ranges)} unique ranges for {app_id} using {len(keywords)} keywords (origin_filter={use_origin})")
+            
+            # Update cache
+            self._ranges_cache[cache_key] = {
+                'timestamp': time.time(),
+                'data': all_ranges
+            }
+            
+            return all_ranges
+            
+        except Exception as e:
+            logger.error(f"Error getting ranges: {e}")
+            return []
 
-                # Check if token expired
-                if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                    logger.info("Token expired, refreshing...")
-                    if self.login():
-                        # Retry request once immediately with refreshed token
-                        resp = self.session.get(
-                            f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=carriers&appId={app_id}",
-                            headers=headers,
-                            timeout=15
-                        )
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if 'data' in data and data['data'] is not None:
-                        return data['data']
-
-                logger.warning(f"get_ranges attempt {attempt}/{max_retries} failed with status {resp.status_code}")
-            except Exception as e:
-                logger.error(f"Error getting ranges (attempt {attempt}/{max_retries}): {e}")
-
-            if attempt < max_retries:
-                time.sleep(1)
-
-        return []
-
-    def get_applications(self, max_retries=5):
-        """Fetch available applications (services) list."""
-        attempt = 0
-        while attempt < max_retries:
-            attempt += 1
-            try:
-                if not self.auth_token:
-                    if not self.login():
-                        return []
-
-                headers = {
-                    "mhitauth": self.auth_token,
-                    **{k: v for k, v in self.browser_headers.items() if k not in ["Origin", "Referer", "Content-Type"]}
-                }
-                headers["Origin"] = self.base_url
-                headers["Referer"] = f"{self.base_url}/dashboard/getnum"
-
-                resp = self.session.get(
-                    f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=applications",
-                    headers=headers,
-                    timeout=15
-                )
-
-                if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                    logger.info("Token expired in get_applications, refreshing...")
-                    if self.login():
-                        resp = self.session.get(
-                            f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getac?type=applications",
-                            headers=headers,
-                            timeout=15
-                        )
-
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and 'data' in data and data['data'] is not None:
-                        return data['data']
-
-                logger.warning(f"get_applications attempt {attempt}/{max_retries} failed with status {resp.status_code}")
-            except Exception as e:
-                logger.error(f"Error in get_applications (attempt {attempt}/{max_retries}): {e}")
-
-            if attempt < max_retries:
-                time.sleep(1)
-
-        return []
+    def get_applications(self, max_retries=3):
+        """Get available applications - Mapped from SERVICE_APP_IDS for compatibility"""
+        # The new API doesn't list "all apps" easily, we search by name.
+        # But for 'Others' menu, we might want to return some defaults or nothing.
+        # Current bot logic allows 'Others' to fetch dynamic list.
+        # For now, we return the primary ones + maybe some popular ones if we want?
+        # Or simply return empty list for others if we don't support dynamic discovery yet.
+        # Let's return the primary ones to ensure they appear if needed.
+        apps = []
+        for name, app_id in SERVICE_APP_IDS.items():
+            apps.append({'id': app_id, 'name': app_id})
+        return apps
     
     def get_number(self, range_id):
         """Request a number from a range"""
@@ -591,21 +643,21 @@ class APIClient:
                     return None
             
             headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "mhitauth": self.auth_token,
-                **{k: v for k, v in self.browser_headers.items() if k != "Content-Type"}
+                **self.browser_headers,
+                "mauthtoken": self.auth_token,
+                "Referer": f"{self.base_url}/mdashboard/getnum?range={range_id}"
             }
-            headers["Referer"] = f"{self.base_url}/dashboard/getnum?range={range_id}"
+            
+            # New API: POST /mapi/v1/mdashboard/getnum/number
+            payload = {
+                "range": range_id,
+                "is_national": False,
+                "remove_plus": False
+            }
             
             resp = self.session.post(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnum",
-                data={
-                    "range": range_id,
-                    "national": "false",
-                    "removePlus": "false",
-                    "app": "null",
-                    "carrier": "null"
-                },
+                f"{self.base_url}/mapi/v1/mdashboard/getnum/number",
+                json=payload,
                 headers=headers,
                 timeout=15
             )
@@ -614,13 +666,16 @@ class APIClient:
                 data = resp.json()
                 if 'data' in data:
                     number_data = data['data']
+                    # Response: {"data":{"number":"+937...", ...}}
                     if isinstance(number_data, dict):
                         if 'number' in number_data:
                             return number_data
-                        elif 'num' in number_data and isinstance(number_data['num'], list) and len(number_data['num']) > 0:
-                            return number_data['num'][0]
-                    elif isinstance(number_data, list) and len(number_data) > 0:
-                        return number_data[0]
+                        # Handle potential alias
+                        if 'copy' in number_data:
+                            number_data['number'] = number_data['copy']
+                            return number_data
+            
+            logger.warning(f"get_number failed: {resp.text[:200]}")
             return None
         except Exception as e:
             logger.error(f"Error getting number: {e}")
@@ -676,183 +731,131 @@ class APIClient:
         return numbers
     
     def check_otp(self, number):
-        """Check for OTP on a number - optimized for speed"""
+        """Check for OTP on a number - using NEW API /mapi/v1/mdashboard/getnum/info"""
         try:
             if not self.auth_token:
                 if not self.login():
                     return None
             
-            today = datetime.now().strftime("%d_%m_%Y")
-            timestamp = int(time.time() * 1000)
+            # Date format YYYY-MM-DD for new API
+            today_str = datetime.now().strftime("%Y-%m-%d")
             
             headers = {
-                **{k: v for k, v in self.browser_headers.items() if k not in ["Origin", "Referer", "Content-Type"]}
+                **self.browser_headers,
+                "mauthtoken": self.auth_token,
+                "Referer": f"{self.base_url}/mdashboard/getnum"
             }
-            headers["Origin"] = self.base_url
-            headers["Referer"] = f"{self.base_url}/dashboard/getnum"
-            # API requires mhitauth as header, not query parameter
-            headers["mhitauth"] = self.auth_token
             
-            # Reduced timeout for faster response
+            # New API: GET /mapi/v1/mdashboard/getnum/info?date=...
             resp = self.session.get(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
-                headers=headers,
-                timeout=8  # Reduced from 15 to 8 seconds
-            )
-            
-            # Check if token expired - only retry once
-            if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                logger.info("Token expired in check_otp, refreshing...")
-                if self.login():
-                    # Retry request once
-                    resp = self.session.get(
-                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
-                        headers=headers,
-                        timeout=8
-                    )
-                else:
-                    return None  # Login failed, return None
-            
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception as json_error:
-                    logger.error(f"Failed to parse JSON response in check_otp: {json_error}, Response text: {resp.text[:500]}")
-                    return None
-                
-                # Log API response structure for debugging
-                logger.debug(f"check_otp API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-                
-                if 'data' in data and data['data'] is not None:
-                    data_obj = data['data']
-                    logger.debug(f"check_otp data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
-                    
-                    if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
-                        numbers = data_obj['num']
-                        logger.debug(f"check_otp found {len(numbers) if isinstance(numbers, list) else 0} numbers in API response")
-                        
-                        if isinstance(numbers, list):
-                            target_normalized = number.replace('+', '').replace(' ', '').replace('-', '').strip()
-                            target_digits = ''.join(filter(str.isdigit, target_normalized))
-                            
-                            # Optimized search - check exact match and last 9 digits in one pass
-                            for num_data in numbers:
-                                if isinstance(num_data, dict):
-                                    num_value = num_data.get('number', '')
-                                    num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
-                                    # Exact match
-                                    if num_normalized == target_normalized:
-                                        return num_data
-                                    # Last 9 digits match
-                                    if len(target_digits) >= 9:
-                                        num_digits = ''.join(filter(str.isdigit, num_value))
-                                    if len(num_digits) >= 9 and num_digits[-9:] == target_digits[-9:]:
-                                        return num_data
-                else:
-                    logger.warning(f"API response structure unexpected. data.data: {data.get('data')}")
-            else:
-                logger.warning(f"check_otp API returned status {resp.status_code}, Response: {resp.text[:500]}")
-            
-            return None
-        except Exception as e:
-            logger.error(f"Error checking OTP: {e}", exc_info=True)
-            return None
-    
-    def check_otp_batch(self, numbers):
-        """Check OTP for multiple numbers in one API call - much faster"""
-        try:
-            if not self.auth_token:
-                if not self.login():
-                    return {}
-            
-            today = datetime.now().strftime("%d_%m_%Y")
-            timestamp = int(time.time() * 1000)
-            
-            headers = {
-                **{k: v for k, v in self.browser_headers.items() if k not in ["Origin", "Referer", "Content-Type"]}
-            }
-            headers["Origin"] = self.base_url
-            headers["Referer"] = f"{self.base_url}/dashboard/getnum"
-            # API requires mhitauth as header, not query parameter
-            headers["mhitauth"] = self.auth_token
-            
-            # Single API call for all numbers
-            resp = self.session.get(
-                f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
+                f"{self.base_url}/mapi/v1/mdashboard/getnum/info?date={today_str}&page=1&search=&status=",
                 headers=headers,
                 timeout=8
             )
             
-            # Check if token expired - only retry once
-            if resp.status_code == 401 or (resp.status_code == 200 and 'expired' in resp.text.lower()):
-                logger.info("Token expired in check_otp_batch, refreshing...")
+            if resp.status_code == 401:
+                logger.info("Token expired in check_otp, refreshing...")
                 if self.login():
+                    headers["mauthtoken"] = self.auth_token
                     resp = self.session.get(
-                        f"{self.base_url}/api/v1/mnitnetworkcom/dashboard/getnuminfo?_date={today}&_page=1&_={timestamp}",
+                        f"{self.base_url}/mapi/v1/mdashboard/getnum/info?date={today_str}&page=1&search=&status=",
                         headers=headers,
                         timeout=8
                     )
                 else:
-                    return {}  # Login failed
+                    return None
             
+            if resp.status_code == 200:
+                data = resp.json()
+                # Expected: {"data": {"numbers": [{"number": "...", "message": "..."}, ...]}}
+                if 'data' in data and data['data']:
+                    numbers_list = data['data'].get('numbers', [])
+                    if numbers_list:
+                        target_normalized = number.replace('+', '').replace(' ', '').strip()
+                        
+                        for num_obj in numbers_list:
+                            api_num = num_obj.get('number', '').replace('+', '').strip()
+                            # Check match & last 9 digits
+                            if api_num == target_normalized or (len(api_num) >= 9 and len(target_normalized) >= 9 and api_num[-9:] == target_normalized[-9:]):
+                                # Found the number.
+                                # New API returns full message in 'otp' and 'message' fields.
+                                # We map 'message' to 'sms_content' and clear 'otp' to let monitor_otp extract the code.
+                                msg = num_obj.get('message') or num_obj.get('otp', '')
+                                if msg:
+                                    num_obj['sms_content'] = msg
+                                    num_obj['otp'] = None  # Clear to force extraction
+                                    return num_obj
+                                else:
+                                    return num_obj 
+            return None
+        except Exception as e:
+            logger.error(f"Error checking OTP: {e}")
+            return None
+    
+    def check_otp_batch(self, numbers):
+        """Check OTP for multiple numbers - using NEW API"""
+        try:
+            if not self.auth_token:
+                if not self.login():
+                    return {}
+            
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            
+            headers = {
+                **self.browser_headers,
+                "mauthtoken": self.auth_token,
+                "Referer": f"{self.base_url}/mdashboard/getnum"
+            }
+            
+            resp = self.session.get(
+                f"{self.base_url}/mapi/v1/mdashboard/getnum/info?date={today_str}&page=1&search=&status=",
+                headers=headers,
+                timeout=8
+            )
+            
+            if resp.status_code == 401:
+                if self.login():
+                    headers["mauthtoken"] = self.auth_token
+                    resp = self.session.get(
+                        f"{self.base_url}/mapi/v1/mdashboard/getnum/info?date={today_str}&page=1&search=&status=",
+                        headers=headers,
+                        timeout=8
+                    )
+                else:
+                    return {}
+
             result = {}
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception as json_error:
-                    logger.error(f"Failed to parse JSON response: {json_error}, Response text: {resp.text[:500]}")
-                    return {}
-                
-                # Log API response structure for debugging
-                logger.debug(f"API Response keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-                
-                if 'data' in data and data['data'] is not None:
-                    data_obj = data['data']
-                    logger.debug(f"data.data keys: {list(data_obj.keys()) if isinstance(data_obj, dict) else 'Not a dict'}")
-                    
-                    if isinstance(data_obj, dict) and 'num' in data_obj and data_obj['num'] is not None:
-                        api_numbers = data_obj['num']
-                        logger.debug(f"Found {len(api_numbers) if isinstance(api_numbers, list) else 0} numbers in API response")
+                data = resp.json()
+                if 'data' in data and data['data']:
+                    numbers_list = data['data'].get('numbers', [])
+                    if numbers_list:
+                        # Create map of API numbers to their data
+                        # We also handle last 9 digits and exact matches
                         
-                        if isinstance(api_numbers, list):
-                            # Normalize all target numbers - create lookup maps
-                            target_exact_match = {}  # exact normalized -> original
-                            target_last9_match = {}  # last 9 digits -> original
+                        target_map_exact = {n.replace('+', '').replace(' ', '').strip(): n for n in numbers}
+                        target_map_last9 = {n.replace('+', '').replace(' ', '').strip()[-9:]: n for n in numbers if len(n.replace('+', '').replace(' ', '').strip()) >= 9}
+                        
+                        for num_obj in numbers_list:
+                            api_num = num_obj.get('number', '').replace('+', '').strip()
                             
-                            for num in numbers:
-                                normalized = num.replace('+', '').replace(' ', '').replace('-', '').strip()
-                                target_exact_match[normalized] = num
-                                # Also store last 9 digits
-                                digits = ''.join(filter(str.isdigit, normalized))
-                                if len(digits) >= 9:
-                                    target_last9_match[digits[-9:]] = num
-                            
-                            # Match all numbers in one pass
-                            for num_data in api_numbers:
-                                if isinstance(num_data, dict):
-                                    num_value = num_data.get('number', '')
-                                    num_normalized = num_value.replace('+', '').replace(' ', '').replace('-', '').strip()
-                                    num_digits = ''.join(filter(str.isdigit, num_value))
-                                    
-                                    # Check exact match first
-                                    if num_normalized in target_exact_match:
-                                        original_num = target_exact_match[num_normalized]
-                                        if original_num not in result:  # Don't overwrite if already found
-                                            result[original_num] = num_data
-                                    # Check last 9 digits match
-                                    elif len(num_digits) >= 9 and num_digits[-9:] in target_last9_match:
-                                        original_num = target_last9_match[num_digits[-9:]]
-                                        if original_num not in result:  # Don't overwrite if already found
-                                            result[original_num] = num_data
-            
-            else:
-                logger.warning(f"API returned status {resp.status_code}, Response: {resp.text[:500]}")
-                if resp.status_code == 401:
-                    logger.warning("Authentication failed - token may be expired")
-            
+                            # Prepare object logic (same as check_otp)
+                            msg = num_obj.get('message') or num_obj.get('otp', '')
+                            if msg:
+                                num_obj['sms_content'] = msg
+                                num_obj['otp'] = None # Forces extraction in monitor_otp
+
+                            # Check match
+                            if api_num in target_map_exact:
+                                origin = target_map_exact[api_num]
+                                result[origin] = num_obj
+                            elif len(api_num) >= 9 and api_num[-9:] in target_map_last9:
+                                origin = target_map_last9[api_num[-9:]]
+                                result[origin] = num_obj
+
             return result
         except Exception as e:
-            logger.error(f"Error checking OTP batch: {e}", exc_info=True)
+            logger.error(f"Error checking OTP batch: {e}")
             return {}
 
 # Global API client - single session for all users
@@ -1985,9 +1988,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session = get_user_session(user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
-                with api_lock:
-                    # Try range_name first, then range_id (like otp_tool.py)
-                    numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+                # with api_lock:
+                # Try range_name first, then range_id (like otp_tool.py)
+                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -2292,11 +2295,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session = get_user_session(user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
-                with api_lock:
-                    logger.info(f"Calling get_multiple_numbers with range_name={range_name}, range_id={range_id}, count={number_count}")
-                    # Try range_name first, then range_id (like otp_tool.py)
-                    numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
-                    logger.info(f"get_multiple_numbers returned: {numbers_data}")
+                # with api_lock:
+                logger.info(f"Calling get_multiple_numbers with range_name={range_name}, range_id={range_id}, count={number_count}")
+                # Try range_name first, then range_id (like otp_tool.py)
+                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+                logger.info(f"get_multiple_numbers returned: {numbers_data}")
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -2656,8 +2659,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     break
             
             if not found_range:
-                await update.message.reply_text(f"❌ Range '{text}' not found in any service.")
-                return
+                # Fallback: Try directly with the input string as both name and ID
+                # Default to WhatsApp as it's the most common use case
+                found_service = "whatsapp"
+                range_name = text
+                range_id = text
+                # Try to detect service from previous context if possible, otherwise WhatsApp
+                message = f"⚠️ Range '{text}' not found in active list.\nTrying direct request via WhatsApp..."
+                await update.message.reply_text(message)
+                
+                # Create a pseudo found_range object
+                found_range = {
+                    'name': text,
+                    'id': text,
+                    'country': 'Unknown',
+                    'cantryName': 'Unknown',
+                    'operator': 'Unknown'
+                }
             
             # Found range - get numbers (like otp_tool.py)
             range_name = found_range.get('name', '')
@@ -3003,8 +3021,9 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         # Check OTP for all numbers in one batch call - much faster (no lag)
         # Use timeout to prevent hanging
         try:
-            with api_lock:
-                otp_results = api_client.check_otp_batch(numbers)
+            # We don't use api_lock here anymore to allow high concurrency
+            # The APIClient.login method is now internally thread-safe
+            otp_results = api_client.check_otp_batch(numbers)
         except Exception as api_error:
             logger.error(f"API error in check_otp_batch: {api_error}")
             return  # Skip this check, will retry next interval
