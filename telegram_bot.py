@@ -52,8 +52,8 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required. Please set it in Render environment variables.")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "7325836764"))
-OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1002724043027"))  # Channel ID for forwarding OTP messages
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5742928021"))
+OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1003403204287"))  # Channel ID for forwarding OTP messages
 
 # API Configuration (from otp_tool.py)
 BASE_URL = "https://stexsms.com"
@@ -71,6 +71,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 SERVICE_APP_IDS = {
     "whatsapp": "WhatsApp",
     "facebook": "Facebook",
+    "telegram": "Telegram",
 }
 
 def init_database():
@@ -115,9 +116,42 @@ def refresh_global_token():
         else:
             get_global_api_client()
 
+# Helper for time parsing
+def parse_time_ago(time_str):
+    """Parse '7 mins ago', '1 hours ago' to minutes"""
+    if not time_str:
+        return 999999 # Treat missing as very old
+        
+    try:
+        parts = str(time_str).lower().split()
+        if len(parts) >= 2:
+            val = int(parts[0])
+            unit = parts[1]
+            
+            if 'sec' in unit:
+                return val / 60
+            elif 'min' in unit:
+                return val
+            elif 'hour' in unit:
+                return val * 60
+            elif 'day' in unit:
+                return val * 1440
+            elif 'week' in unit:
+                return val * 10080
+            elif 'month' in unit:
+                return val * 43200
+                
+        return 999999
+    except:
+        return 999999
+
 def get_user_status(user_id):
     """Get user approval status from database"""
     try:
+        # Always approve admin
+        if int(user_id) == ADMIN_USER_ID:
+            return 'approved'
+            
         with db_lock:
             # Use integer user_id (BIGINT in database)
             result = supabase.table('users').select('status').eq('user_id', int(user_id)).execute()
@@ -133,14 +167,15 @@ def get_user_status(user_id):
         return 'pending'
 
 def add_user(user_id, username):
-    """Add new user to database"""
+    """Add new user to database (Auto-approved)"""
     try:
         with db_lock:
             # Use integer user_id (BIGINT in database)
             supabase.table('users').upsert({
                 'user_id': int(user_id),
                 'username': username,
-                'status': 'approved'
+                'status': 'approved',
+                'approved_at': datetime.now().isoformat()
             }).execute()
     except Exception as e:
         logger.error(f"Error adding user: {e}")
@@ -485,43 +520,63 @@ class APIClient:
             else:
                 payload["origin"] = ""  # Blank for Others
             
-            resp = self.session.post(
-                f"{self.base_url}/mapi/v1/mdashboard/access/info",
-                json=payload,
-                headers=headers,
-                timeout=15
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
-                    ranges = []
-                    for item in data['data']:
-                        destination = item.get('destination', 'Unknown')
-                        country = destination.split('-')[0].strip() if '-' in destination else destination
-                        
-                        range_val = item.get('test_number')
-                        if range_val:
-                            range_obj = {
-                                'id': range_val,
-                                'range_id': str(item.get('id')),
-                                'name': range_val,
-                                'country': country,
-                                'cantryName': country,
-                                'operator': destination,
-                                'limit_day': item.get('limit_day'),
-                                'limit_hour': item.get('limit_hour')
-                            }
+            # Implementation of retry logic for token expiration
+            max_fetches = 2
+            for attempt in range(max_fetches):
+                # Update token in headers (in case it was refreshed)
+                if self.auth_token:
+                    headers["mauthtoken"] = self.auth_token
+
+                resp = self.session.post(
+                    f"{self.base_url}/mapi/v1/mdashboard/access/info",
+                    json=payload,
+                    headers=headers,
+                    timeout=15
+                )
+                
+                # Check for token expiration
+                if resp.status_code in [401, 403] or "unauthorized" in resp.text.lower():
+                    logger.warning(f"Token expired (Status {resp.status_code}), refreshing...")
+                    self.auth_token = None
+                    if self.login():
+                        # Retry loop will pick up new token
+                        continue
+                    else:
+                        return [] # Login failed
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
+                        ranges = []
+                        for item in data['data']:
+                            destination = item.get('destination', 'Unknown')
+                            country = destination.split('-')[0].strip() if '-' in destination else destination
                             
-                            # For Others service, include the actual service name from API
-                            if not use_origin:
-                                service_name = item.get('origin', 'Unknown')
-                                range_obj['service'] = service_name
-                                # Append service to operator for display
-                                range_obj['operator'] = f"{destination} ({service_name})"
-                            
-                            ranges.append(range_obj)
-                    return ranges
+                            range_val = item.get('test_number')
+                            if range_val:
+                                range_obj = {
+                                    'id': range_val,  # Pattern like "9965579XXX" - PRIMARY identifier
+                                    'numerical_id': str(item.get('id')),  # Numerical ID for reference only
+                                    'range_id': range_val,  # Use pattern as range_id (API expects this)
+                                    'name': range_val,
+                                    'pattern': range_val,
+                                    'country': country,
+                                    'cantryName': country,
+                                    'operator': destination,
+                                    'limit_day': item.get('limit_day'),
+                                    'limit_hour': item.get('limit_hour'),
+                                    'datetime': item.get('datetime', '')  # Extract timestamp (e.g., "7 mins ago")
+                                }
+                                
+                                # For Others service, include the actual service name from API
+                                if not use_origin:
+                                    service_name = item.get('origin', 'Unknown')
+                                    range_obj['service'] = service_name
+                                    # Append service to operator for display
+                                    range_obj['operator'] = f"{destination} ({service_name})"
+                                
+                                ranges.append(range_obj)
+                        return ranges
             return []
         except Exception as e:
             logger.warning(f"Error fetching with keyword '{keyword}': {e}")
@@ -542,8 +597,8 @@ class APIClient:
                     logger.info(f"Returning cached ranges for {app_id}")
                     return entry['data']
             
-            # Determine if this is WhatsApp/Facebook or Others
-            is_specific_service = app_id.lower() in ['whatsapp', 'facebook']
+            # Determine if this is WhatsApp/Facebook/Telegram or Others
+            is_specific_service = app_id.lower() in ['whatsapp', 'facebook', 'telegram']
             
             # Keywords for WhatsApp/Facebook (with origin filter)
             specific_keywords = [
@@ -561,40 +616,82 @@ class APIClient:
             
             # Keywords for Others (no origin filter - broader search)
             others_keywords = [
-                "code",           # Verification code
-                "otp",            # One-time password
-                "verify",         # Verification
-                "authentication", # Auth messages
-                "sms",            # SMS messages
-                "message",        # General messages
-                "notification",   # Notifications
-                "",               # Empty for general
+                "verification", "code", "otp", "verify", "sms", "message", "auth", "login",
+                "conf", "confirm", "pin", "secure", "access", "validate", "check", "pass",
+                "password", "text", "msg", "notification", "notify", "info", "alert", "update",
+                "app", "web", "net", "com", "org", "verify-code", "any", "vantage", ""
             ]
             
             # Select keywords and origin usage based on service type
             if is_specific_service:
                 keywords = specific_keywords
                 use_origin = True
-            else:
+            elif app_id.lower() == "others":
                 keywords = others_keywords
+                use_origin = False
+            else:
+                # Specific other service (e.g. Google, Instagram)
+                # Search using the service name itself WITHOUT origin filter
+                # This matches the discovery behavior and is more compatible
+                keywords = [app_id]
                 use_origin = False
             
             all_ranges = []
             unique_range_names = set()  # Use range name (phone number) for deduplication, not range_id
             
-            for kw in keywords:
-                ranges = self._fetch_ranges_with_keyword(app_id, kw, use_origin)
-                
-                # Add only unique ranges (by range name/phone number pattern)
-                for r in ranges:
-                    range_name = r['name']  # e.g., "37525XXXX"
-                    if range_name not in unique_range_names:
-                        unique_range_names.add(range_name)
-                        all_ranges.append(r)
+            # Fallback strategy for specific other services
+            if not is_specific_service and app_id.lower() != "others":
+                # Try specific keyword first (Fast)
+                keywords_list = [[app_id]]
+                # If that fails, we might need to fallback to broad search
+                # But broad search is slow (30 requests). 
+                # Let's try to be smart - maybe just try generic 'code', 'otp' if specific fails?
+                # Actually, let's just stick to specific first. If it returns 0, we can decide.
+                # However, for now, let's use the provided logic:
+                keywords = [app_id]
+            
+            all_ranges = []
+            unique_range_names = set()
+            
+            # Helper to run search
+            def run_search(kw_list):
+                found_count = 0
+                for kw in kw_list:
+                    ranges = self._fetch_ranges_with_keyword(app_id, kw, use_origin)
+                    if ranges and found_count == 0:
+                         # Log keys of first item for debugging (timestamp analysis)
+                         logger.info(f"DEBUG: Item keys: {list(ranges[0].keys())}")
+                         
+                    for r in ranges:
+                        range_name = r['name']
+                        if range_name not in unique_range_names:
+                            # Client-side filter
+                            if not is_specific_service and app_id.lower() != "others":
+                                range_service = r.get('service', '').strip()
+                                if range_service and app_id.lower() not in range_service.lower():
+                                    logger.info(f"Skipping range {range_name} (service={range_service}) for app_id={app_id}")
+                                    continue
+                                logger.info(f"Including range {range_name} (service={range_service}) for app_id={app_id}")
+                            
+                            unique_range_names.add(range_name)
+                            all_ranges.append(r)
+                            found_count += 1
+                return found_count
+
+            # Execute search
+            count = run_search(keywords)
+            
+            # Fallback for Others: If specific search yielded 0 results, try broad search
+            if count == 0 and not is_specific_service and app_id.lower() != "others":
+                logger.info(f"Specific search for '{app_id}' yielded 0 results. Falling back to broad search...")
+                # Use a subset of most likely keywords to save time, or full list?
+                # Full list is safer but slower. 
+                count = run_search(others_keywords)
+
             
             # Extra searches for specific WhatsApp prefixes
             if is_specific_service and 'whatsapp' in app_id.lower():
-                prefixes = ["225", "228", "229", "232", "236", "237", "244", "977"]
+                prefixes = ["225", "228", "229", "232", "236", "237", "244", "261", "977"]
                 logger.info(f"Fetching extra ranges for WhatsApp prefixes: {prefixes}")
                 for pfx in prefixes:
                     ranges = self._fetch_ranges_with_keyword(app_id, "", use_origin, prefix=pfx)
@@ -610,11 +707,12 @@ class APIClient:
 
             logger.info(f"Found {len(all_ranges)} unique ranges for {app_id} using {len(keywords)} keywords (origin_filter={use_origin})")
             
-            # Update cache
-            self._ranges_cache[cache_key] = {
-                'timestamp': time.time(),
-                'data': all_ranges
-            }
+            # Update cache only if we found ranges
+            if len(all_ranges) > 0:
+                self._ranges_cache[cache_key] = {
+                    'timestamp': time.time(),
+                    'data': all_ranges
+                }
             
             return all_ranges
             
@@ -692,15 +790,17 @@ class APIClient:
         while len(numbers) < count and total_attempts < max_total_attempts:
             total_attempts += 1
             try:
-                # Try range_name first (like otp_tool.py line 561)
+                # Try range_name first (this is the pattern like "9965579XXX")
                 number_data = None
                 if range_name:
+                    logger.info(f"Attempting with range_name (pattern): {range_name}")
                     number_data = self.get_number(range_name)
                 
-                # If range_name didn't work, try range_id
-                if not number_data:
+                # Fallback to range_id only if range_name fails and they're different
+                if not number_data and range_id != range_name:
+                    logger.info(f"Fallback: attempting with range_id: {range_id}")
                     number_data = self.get_number(range_id)
-                
+                    
                 if number_data:
                     num_val = number_data.get('number') or number_data.get('num')
                     if num_val:
@@ -1431,6 +1531,7 @@ async def rangechkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("💬 WhatsApp", callback_data="rangechkr_service_whatsapp")],
         [InlineKeyboardButton("👥 Facebook", callback_data="rangechkr_service_facebook")],
+        [InlineKeyboardButton("✈️ Telegram", callback_data="rangechkr_service_telegram")],
         [InlineKeyboardButton("✨ Others", callback_data="rangechkr_service_others")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1694,9 +1795,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Error setting number count. Please try again.")
         return
     
+    # Main menu Others pagination handlers
+    if data == "sel_others_prev":
+        page = context.user_data.get('service_others_page', 0)
+        context.user_data['service_others_page'] = max(0, page - 1)
+        query.data = "service_others"
+        # Since we modified query.data, we can just let it fall through to service_ handler
+        # But explicit call is safer if service_ handler is below
+        # Wait, if I call await button_callback, it recurses.
+        # But if I change data and let it continue?
+        # NO, 'data' variable is local string copy. Modifying it doesn't affect subsequent checks unless I modify 'data' var AND code is structured to check updated 'data'.
+        # The code below checks `if data.startswith("service_"):`.
+        # So if I update `data = "service_others"`, it will fall through!
+        data = "service_others" 
+        # Fall through to service_ handler
+    
+    elif data == "sel_others_next":
+        page = context.user_data.get('service_others_page', 0)
+        context.user_data['service_others_page'] = page + 1
+        data = "service_others"
+        # Fall through
+        
+    elif data == "sel_others_noop":
+        try: await query.answer("Current page")
+        except: pass
+        return
+
+    # Main menu Others specific service selection
+    elif data.startswith("sel_others_"):
+        try:
+            # Format: sel_others_{idx}
+            idx = int(data.split("_")[2])
+            discovered = context.user_data.get('discovered_services', [])
+            if 0 <= idx < len(discovered):
+                svc = discovered[idx]
+                logger.info(f"Selected {svc} from Main Menu Others")
+                # Redirect to standard service handler
+                data = f"service_{svc}"
+                # Fall through to service_ handler
+            else:
+                await query.edit_message_text("❌ Service not found. Please reload.")
+                return
+        except Exception as e:
+            logger.error(f"Error selecting from others: {e}")
+            await query.edit_message_text("❌ Error selecting service.")
+            return
     # Service selection (from inline buttons)
     if data.startswith("service_"):
-        service_name = data.split("_")[1]
+        service_name = data.split("_", 1)[1]
         
         # Get global API client
         api_client = get_global_api_client()
@@ -1706,38 +1852,87 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # If Others clicked, first show dynamic service list (excluding WhatsApp/Facebook)
         if service_name == "others":
+            await query.edit_message_text("⏳ Discovering services (this may take a moment)...")
             try:
-                with api_lock:
-                    apps = api_client.get_applications()
-                if not apps:
+                # Use get_ranges("others") which searches many keywords
+                # No lock needed as APIClient handles internal state
+                ranges = api_client.get_ranges("others")
+                
+                if not ranges:
                     await query.edit_message_text("❌ No services found.")
                     return
 
-                primary_ids = set(SERVICE_APP_IDS.values())
-                other_apps = []
-                for app in apps:
-                    app_id = app.get('appId') or app.get('id')
-                    app_name = app.get('name') or app.get('application') or app_id
-                    if app_id and app_id not in primary_ids:
-                        other_apps.append({"id": app_id, "name": app_name})
-
-                if not other_apps:
-                    await query.edit_message_text("❌ No other services available.")
-                    return
-
-                context.user_data['other_services'] = other_apps
-                context.user_data.setdefault('custom_services', {})
-
+                # Aggregate by service
+                services_found = {} # {service_name: count}
+                
+                for r in ranges:
+                    svc = r.get('service', 'Other')
+                    if not svc: svc = 'Other'
+                    svc = str(svc).strip()
+                    if svc == "": svc = "Other"
+                    
+                    if svc not in services_found:
+                        services_found[svc] = 0
+                        
+                    services_found[svc] += 1
+                
+                sorted_services = sorted(services_found.keys())
+                context.user_data['discovered_services'] = sorted_services
+                
+                # Pagination logic
+                page = context.user_data.get('service_others_page', 0)
+                services_per_page = 90
+                total_pages = (len(sorted_services) + services_per_page - 1) // services_per_page
+                
+                start_idx = page * services_per_page
+                end_idx = min(start_idx + services_per_page, len(sorted_services))
+                page_services = sorted_services[start_idx:end_idx]
+                
                 keyboard = []
-                for idx, app in enumerate(other_apps):
-                    label = app['name'] or app['id']
-                    keyboard.append([InlineKeyboardButton(label, callback_data=f"serviceapp_{idx}")])
+                row = []
+                for idx in range(start_idx, end_idx):
+                     svc = sorted_services[idx]
+                     # Skip primary if found (optional, but better UX to keep separate)
+                     # But if user wants EVERYTHING in others, I could remove this.
+                     # "Whatsapp and Facebook flow unchanged" implies they stay in main menu.
+                     if svc.lower() in ['whatsapp', 'facebook']: continue
+                     
+                     count = services_found[svc]
+                     # Capitalize for display
+                     label = f"{svc} ({count})"
+                     
+                     # Callback: sel_others_{idx} (Changed from service_others to avoid conflict)
+                     row.append(InlineKeyboardButton(label, callback_data=f"sel_others_{idx}"))
+                     
+                     if len(row) == 2:
+                         keyboard.append(row)
+                         row = []
+                
+                if row:
+                    keyboard.append(row)
+                
+                # Pagination buttons
+                if total_pages > 1:
+                    nav_row = []
+                    if page > 0:
+                        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="sel_others_prev"))
+                    nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="sel_others_noop"))
+                    if page < total_pages - 1:
+                        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="sel_others_next"))
+                    keyboard.append(nav_row)
+                
                 keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_services")])
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text("📋 Select a service:", reply_markup=reply_markup)
+                
+                page_info = f" (Page {page + 1}/{total_pages})" if total_pages > 1 else ""
+                await query.edit_message_text(
+                    f"📋 Found {len(sorted_services)} Services{page_info}:\nShowing {len(page_services)} services", 
+                    reply_markup=reply_markup
+                )
+            
             except Exception as e:
-                logger.error(f"Error loading applications: {e}")
-                await query.edit_message_text("❌ Failed to load services. Please try again.")
+                logger.error(f"Error discovering services: {e}")
+                await query.edit_message_text(f"❌ Error discovering services: {str(e)}")
             return
         
         # For primary services (WhatsApp/Facebook)
@@ -1780,23 +1975,63 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Create country buttons - INLINE KEYBOARD
         keyboard = []
-        country_list = [c for c in sorted(country_ranges.keys()) if c != 'Unknown']
-        if 'Unknown' in country_ranges and len(country_list) == 0:
-            country_list.append('Unknown')
+        
+        # Helper to get "best" time for a country
+        def get_country_best_time(c_name):
+            ranges_list = country_ranges.get(c_name, [])
+            best_min = 999999
+            best_str = ""
+            for r in ranges_list:
+                t_str = r.get('datetime', '')
+                t_min = parse_time_ago(t_str)
+                if t_min < best_min:
+                    best_min = t_min
+                    best_str = t_str
+            return best_min, best_str
 
-        for i in range(0, len(country_list), 2):
+        # Sort countries by recency (Ascending minutes ago)
+        # Using 999999 as default sort key ensures unknown times go to bottom
+        sorted_countries = sorted(
+            [c for c in country_ranges.keys() if c != 'Unknown'],
+            key=lambda c: get_country_best_time(c)[0]
+        )
+        
+        if 'Unknown' in country_ranges and len(sorted_countries) == 0:
+            sorted_countries.append('Unknown')
+
+        # Helper for UI Truncation
+        def format_country_label(flag, name, time_str, max_len=30):
+            if not time_str:
+                return f"{flag} {name}"
+            
+            time_part = f" ({time_str})"
+            # Calculate remaining space for name
+            # flag (2) + space (1) + name + time_part
+            # name <= max_len - len(time_part) - 3
+            available_len = max_len - len(time_part) - 3
+            if available_len < 5: available_len = 5 # Safety floor
+            
+            if len(name) > available_len:
+                name = name[:available_len-1] + "…"
+            
+            return f"{flag} {name}{time_part}"
+
+        for i in range(0, len(sorted_countries), 2):
             row = []
-            flag1 = get_country_flag(country_list[i])
-            row.append(InlineKeyboardButton(
-                f"{flag1} {country_list[i]}",
-                callback_data=f"country_{service_name}_{country_list[i]}"
-            ))
-            if i + 1 < len(country_list):
-                flag2 = get_country_flag(country_list[i + 1])
-                row.append(InlineKeyboardButton(
-                    f"{flag2} {country_list[i + 1]}",
-                    callback_data=f"country_{service_name}_{country_list[i + 1]}"
-                ))
+            
+            c1 = sorted_countries[i]
+            _, time1 = get_country_best_time(c1)
+            flag1 = get_country_flag(c1)
+            label1 = format_country_label(flag1, c1, time1)
+            
+            row.append(InlineKeyboardButton(label1, callback_data=f"country_{service_name}_{c1}"))
+            
+            if i + 1 < len(sorted_countries):
+                c2 = sorted_countries[i + 1]
+                _, time2 = get_country_best_time(c2)
+                flag2 = get_country_flag(c2)
+                label2 = format_country_label(flag2, c2, time2)
+                row.append(InlineKeyboardButton(label2, callback_data=f"country_{service_name}_{c2}"))
             keyboard.append(row)
 
         keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_services")])
@@ -1808,96 +2043,127 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Service selection for dynamic Others list
-    if data.startswith("serviceapp_"):
-        idx = int(data.split("_")[1])
-        other_apps = context.user_data.get('other_services', [])
-        if idx < 0 or idx >= len(other_apps):
-            await query.edit_message_text("❌ Invalid service.")
-            return
-        app = other_apps[idx]
-        app_id = app['id']
-        service_key = f"app{idx}"
-        service_label = app.get('name') or app_id
-
-        # Register this custom service for this user (used later in country callbacks)
-        context.user_data.setdefault('custom_services', {})
-        context.user_data['custom_services'][service_key] = app_id
-
-        # Get global API client
-        api_client = get_global_api_client()
-        if not api_client:
-            await query.edit_message_text("❌ API connection error. Please try again.")
-            return
-
-        with api_lock:
-            ranges = api_client.get_ranges(app_id)
-
-        if not ranges:
-            await query.edit_message_text(f"❌ No active ranges available for {service_label}.")
-            return
-        
-        # For downstream country callback, use service_key as identifier
-        service_name = service_key
-        
-        # Group ranges by country - detect from range name if country not available
-        country_ranges = {}
-        for r in ranges:
-            range_name = r.get('name', r.get('id', ''))
-            # Try to get country from API response first
-            country = r.get('cantryName', r.get('country', ''))
+    # Service selection for dynamic Others list (New Flow)
+    if data.startswith("service_others_"):
+        try:
+            idx = int(data.split("_")[2])
+            discovered = context.user_data.get('discovered_services', [])
+            if idx < 0 or idx >= len(discovered):
+                await query.edit_message_text("❌ Invalid service.")
+                return
+                
+            service_name = discovered[idx]
+            # Create a safe key for callback
+            service_key = f"others_{idx}"
             
-            # If country not found or Unknown, detect from range name
-            if not country or country == 'Unknown' or country.strip() == '':
-                country = detect_country_from_range(range_name)
+            # Register in custom_services for resolution
+            context.user_data.setdefault('custom_services', {})
+            context.user_data['custom_services'][service_key] = service_name
             
-            # Only use Unknown as last resort - try harder to detect
-            if not country or country == 'Unknown':
-                # Try to extract from range name more aggressively
-                range_str = str(range_name).upper()
-                # Sometimes range name contains country code in different format
-                for code, c_name in COUNTRY_CODES.items():
-                    if code in range_str or c_name.upper() in range_str:
-                        country = c_name
-                        break
+            # Get API client
+            api_client = get_global_api_client()
+            if not api_client:
+                await query.edit_message_text("❌ API connection error.")
+                return
+                
+            # Get ranges "others" (cached)
+            ranges = api_client.get_ranges("others")
             
-            # Final fallback - use detected or keep as Unknown
-            if not country:
-                country = 'Unknown'
+            if not ranges:
+                await query.edit_message_text("❌ No ranges found (session expired?).")
+                return
+                
+            # Filter by service (Relaxed matching)
+            service_ranges = []
+            service_norm = service_name.lower()
+            for r in ranges:
+                 s = str(r.get('service', 'Other')).lower()
+                 if s and (service_norm in s or s in service_norm):
+                     service_ranges.append(r)
             
-            if country not in country_ranges:
-                country_ranges[country] = []
-            country_ranges[country].append(r)
-        
-        # Create country buttons - INLINE KEYBOARD
-        keyboard = []
-        # Filter out Unknown countries - try to detect them first
-        country_list = []
-        for country in sorted(country_ranges.keys()):
-            if country != 'Unknown':
-                country_list.append(country)
-        
-        # Only add Unknown if we really can't detect any country
-        if 'Unknown' in country_ranges and len(country_list) == 0:
-            country_list.append('Unknown')
-        
-        # Create inline keyboard rows (2 buttons per row)
-        for i in range(0, len(country_list), 2):
-            row = []
-            flag1 = get_country_flag(country_list[i])
-            row.append(InlineKeyboardButton(f"{flag1} {country_list[i]}", callback_data=f"country_{service_name}_{country_list[i]}"))
-            if i + 1 < len(country_list):
-                flag2 = get_country_flag(country_list[i + 1])
-                row.append(InlineKeyboardButton(f"{flag2} {country_list[i + 1]}", callback_data=f"country_{service_name}_{country_list[i + 1]}"))
-            keyboard.append(row)
-        
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_services")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"📱 {service_name.upper()} - Select Country:",
-            reply_markup=reply_markup
-        )
+            # Debug log for filtering failure
+            if not service_ranges:
+                 logger.info(f"Filtering mismatch: Target='{service_name}'. Samples: {[r.get('service') for r in ranges[:5]]}")
+            
+            if not service_ranges:
+                 await query.edit_message_text(f"❌ No ranges found for {service_name}.")
+                 return
+                 
+            # Group by Country
+            country_ranges = {}
+            for r in service_ranges:
+                range_name = r.get('name', r.get('id', ''))
+                country = r.get('cantryName', r.get('country', ''))
+                
+                if not country or country == 'Unknown' or str(country).strip() == '':
+                    country = detect_country_from_range(range_name)
+                
+                if not country or country == 'Unknown':
+                    range_str = str(range_name).upper()
+                    for code, c_name in COUNTRY_CODES.items():
+                        if code in range_str or c_name.upper() in range_str:
+                            country = c_name
+                            break
+                
+                if not country: country = 'Unknown'
+                
+                country_ranges.setdefault(country, []).append(r)
+            
+            # Create country buttons
+            keyboard = []
+            
+            # Helper to get "best" time for a country
+            def get_country_best_time(c_name):
+                ranges_list = country_ranges.get(c_name, [])
+                # Use cached timestamps if available, or parse again
+                best_min = 999999
+                best_str = ""
+                for r in ranges_list:
+                    t_str = r.get('datetime', '')
+                    t_min = parse_time_ago(t_str)
+                    if t_min < best_min:
+                        best_min = t_min
+                        best_str = t_str
+                return best_min, best_str
+
+            # Sort countries by recency
+            sorted_countries = sorted(
+                [c for c in country_ranges.keys() if c != 'Unknown'],
+                key=lambda c: get_country_best_time(c)[0]
+            )
+            
+            if 'Unknown' in country_ranges and len(sorted_countries) == 0:
+                sorted_countries.append('Unknown')
+                
+            for i in range(0, len(sorted_countries), 2):
+                row = []
+                
+                c1 = sorted_countries[i]
+                _, time1 = get_country_best_time(c1)
+                flag1 = get_country_flag(c1)
+                label1 = format_country_label(flag1, c1, time1)
+                
+                row.append(InlineKeyboardButton(label1, callback_data=f"country_{service_key}_{c1}"))
+                
+                if i + 1 < len(sorted_countries):
+                    c2 = sorted_countries[i + 1]
+                    _, time2 = get_country_best_time(c2)
+                    flag2 = get_country_flag(c2)
+                    label2 = format_country_label(flag2, c2, time2)
+                    row.append(InlineKeyboardButton(label2, callback_data=f"country_{service_key}_{c2}"))
+                
+                keyboard.append(row)
+                
+            keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="service_others")]) 
+            # Back goes to Main Others List (handled by service_others in main handler)
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(f"📱 {service_name} - Select Country:", reply_markup=reply_markup)
+            
+        except Exception as e:
+            logger.error(f"Error in service_others: {e}")
+            await query.edit_message_text("❌ Error loading countries.")
+        return
     
     # Note: num_copy_ handler removed - using copy_text parameter in InlineKeyboardButton
     # When copy_text is used, button click directly copies text without callback
@@ -1971,8 +2237,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ No ranges found for {country}.")
             return
         
-        range_id = selected_range.get('name', selected_range.get('id', ''))
-        range_name = selected_range.get('name', '')
+        range_id = selected_range.get('numerical_id', selected_range.get('range_id', selected_range.get('id', '')))
+        range_name = selected_range.get('pattern', selected_range.get('name', ''))
         
         # Show loading message and acknowledge callback immediately
         await query.edit_message_text("⏳ Requesting numbers...")
@@ -2025,6 +2291,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
                 
                 # Start monitoring all numbers in background
+                # First, cancel any existing job to reset 15-min timer
+                if user_id in user_jobs:
+                    try:
+                        old_job = user_jobs[user_id]
+                        old_job.schedule_removal()
+                    except Exception as e:
+                        logger.error(f"Error cancelling old job: {e}")
+
                 job = context.job_queue.run_repeating(
                     monitor_otp,
                     interval=3,  # Increased to 3 seconds to prevent overlap
@@ -2092,39 +2366,264 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(fetch_and_send_numbers())
         return
     
-    # Range checker service selection from dynamic list (Others)
-    elif data.startswith("rangechkr_serviceapp_"):
-        idx = int(data.split("_")[2])
-        other_apps = context.user_data.get('rangechkr_other_services', [])
-        if idx < 0 or idx >= len(other_apps):
-            await query.edit_message_text("❌ Invalid service.")
+    # Range checker service selection from dynamic list (Others) - New Flow
+    elif data.startswith("rangechkr_others_"):
+        try:
+            idx = int(data.split("_")[2])
+            discovered = context.user_data.get('rangechkr_discovered_services', [])
+            if idx < 0 or idx >= len(discovered):
+                await query.edit_message_text("❌ Invalid service.")
+                return
+            
+            service_name = discovered[idx]
+            # Unique key to avoid conflict with main flow
+            service_key = f"rng_others_{idx}"
+            
+            # Register in custom_services for resolution (shared map)
+            context.user_data.setdefault('custom_services', {})
+            context.user_data['custom_services'][service_key] = service_name
+            
+            # Get global API client
+            api_client = get_global_api_client()
+            if not api_client:
+                await query.edit_message_text("❌ API connection error. Please try again.")
+                return
+            
+            # Get ranges "others" (cached fast)
+            ranges = api_client.get_ranges("others")
+            
+            if not ranges:
+                await query.edit_message_text(f"❌ No ranges found for {service_name}.")
+                return
+            
+            # Filter by service
+            service_ranges = []
+            for r in ranges:
+                s = r.get('service', 'Other')
+                if s and str(s).strip() == service_name:
+                    service_ranges.append(r)
+            
+            if not service_ranges:
+                await query.edit_message_text(f"❌ No ranges found for {service_name}.")
+                return
+                
+            # Group ranges by country - detect from range name if country not available
+            country_ranges = {}
+            for r in service_ranges:
+                range_name = r.get('name', r.get('id', ''))
+                country = r.get('cantryName', r.get('country', ''))
+                
+                if not country or country == 'Unknown' or str(country).strip() == '':
+                    country = detect_country_from_range(range_name)
+                
+                if not country or country == 'Unknown':
+                    range_str = str(range_name).upper()
+                    for code, country_name in COUNTRY_CODES.items():
+                        if code in range_str or country_name.upper() in range_str:
+                            country = country_name
+                            break
+                
+                if not country: country = 'Unknown'
+                
+                country_ranges.setdefault(country, []).append(r)
+
+            # Create country buttons - INLINE KEYBOARD
+            keyboard = []
+            country_list = [c for c in sorted(country_ranges.keys()) if c != 'Unknown']
+            if 'Unknown' in country_ranges and len(country_list) == 0:
+                country_list.append('Unknown')
+
+            for i in range(0, len(country_list), 2):
+                row = []
+                flag1 = get_country_flag(country_list[i])
+                row.append(InlineKeyboardButton(
+                    f"{flag1} {country_list[i]}",
+                    callback_data=f"rangechkr_country_{service_key}_{country_list[i]}"
+                ))
+                if i + 1 < len(country_list):
+                    flag2 = get_country_flag(country_list[i + 1])
+                    row.append(InlineKeyboardButton(
+                        f"{flag2} {country_list[i + 1]}",
+                        callback_data=f"rangechkr_country_{service_key}_{country_list[i + 1]}"
+                    ))
+                keyboard.append(row)
+            
+            keyboard.append([InlineKeyboardButton("🔙 Back to Services", callback_data="rangechkr_service_others")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await query.edit_message_text(
+                f"📋 {service_name} - Select Country:",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Error fetching ranges for {service_name}: {e}")
+            await query.edit_message_text(f"❌ Failed to load ranges.")
             return
-        service_app = other_apps[idx]
-        service_name = service_app.get('id')
-        service_label = service_app.get('name', service_name)
+    
+    # Others service pagination handlers
+    elif data == "rangechkr_others_prev":
+        page = context.user_data.get('rangechkr_others_page', 0)
+        context.user_data['rangechkr_others_page'] = max(0, page - 1)
+        # Trigger service list reload by simulating rangechkr_service_others callback
+        query.data = "rangechkr_service_others"
+        await button_callback(update, context)
+        return
+    
+    elif data == "rangechkr_others_next":
+        page = context.user_data.get('rangechkr_others_page', 0)
+        context.user_data['rangechkr_others_page'] = page + 1
+        # Trigger service list reload
+        query.data = "rangechkr_service_others"
+        await button_callback(update, context)
+        return
+    
+    elif data == "rangechkr_others_noop":
+        # Just answer the callback, don't do anything
+        try:
+            await query.answer("Current page")
+        except:
+            pass
+        return
+    
+    # Selection of specific service from Others list
+    elif data.startswith("rangechkr_others_"):
+        try:
+            # Format: rangechkr_others_{idx}
+            idx_str = data.split("_")[2]
+            if idx_str.isdigit():
+                idx = int(idx_str)
+                discovered_services = context.user_data.get('rangechkr_discovered_services', [])
+                if 0 <= idx < len(discovered_services):
+                    service_name = discovered_services[idx]
+                    logger.info(f"User selected service from Others list: {service_name} (index {idx})")
+                    # Redirect to standard service handler
+                    query.data = f"rangechkr_service_{service_name}"
+                    await button_callback(update, context)
+                    return
+                else:
+                    await query.edit_message_text("❌ Service not found in session. Please reload.")
+                    return
+        except Exception as e:
+            logger.error(f"Error handling others service selection: {e}")
+            await query.edit_message_text("❌ Error selecting service.")
+            return
+    
+    # Range checker country selection
+    elif data.startswith("rangechkr_country_"):
+        parts = data.split("_", 3)
+        if len(parts) < 4:
+            await query.edit_message_text("❌ Invalid selection.")
+            return
+            
+        service_name = parts[2]
+        country = parts[3]
         
         # Get global API client
         api_client = get_global_api_client()
         if not api_client:
-            await query.edit_message_text("❌ API connection error. Please try again.")
+            await query.edit_message_text("❌ API connection error.")
             return
-        
-        await query.edit_message_text(f"⏳ Loading ranges for {service_label}...")
+            
+        await query.edit_message_text(f"⏳ Loading ranges for {country}...")
         
         try:
-            with api_lock:
-                ranges = api_client.get_ranges(service_name)
+            # Determine App ID
+            app_id = resolve_app_id(service_name, context)
+            if not app_id:
+                app_id = service_name
             
-            if not ranges or len(ranges) == 0:
-                await query.edit_message_text(f"❌ No ranges found for {service_label}.")
+            # Fetch ranges
+            ranges = api_client.get_ranges(app_id)
+            
+            # Filter by country
+            filtered_ranges = []
+            if ranges:
+                for r in ranges:
+                    range_name = r.get('name', r.get('id', ''))
+                    r_country = r.get('cantryName', r.get('country', ''))
+                    if not r_country or r_country == 'Unknown' or str(r_country).strip() == '':
+                         r_country = detect_country_from_range(range_name)
+                         if not r_country or r_country == 'Unknown':
+                             range_str = str(range_name).upper()
+                             for code, cname in COUNTRY_CODES.items():
+                                 if code in range_str or cname.upper() in range_str:
+                                     r_country = cname
+                                     break
+                    if not r_country: r_country = 'Unknown'
+                    
+                    if r_country == country:
+                        filtered_ranges.append(r)
+            
+            if not filtered_ranges:
+                await query.edit_message_text(f"❌ No ranges found for {country}.")
                 return
+            
+            # Create keyboard with filtered ranges
+            keyboard = []
+            if 'range_mapping' not in context.user_data:
+                context.user_data['range_mapping'] = {}
+            
+            for i in range(0, len(filtered_ranges), 2):
+                row = []
+                range1 = filtered_ranges[i]
+                range_name1 = range1.get('pattern', range1.get('name', ''))
+                # Use range_id (which is now the pattern) as primary identifier
+                range_id1 = range1.get('range_id') or range1.get('numerical_id') or range_name1
+                range_id_field1 = range1.get('numerical_id') or range1.get('range_id') or ''
+                actual_service = service_name # Use the service/app ID we are browsing
+                
+                range_hash1 = hashlib.md5(f"{actual_service}_{range_id1}".encode()).hexdigest()[:12]
+                context.user_data['range_mapping'][range_hash1] = {
+                    'service': actual_service,
+                    'range_id': range_id1,
+                    'range_name': range_name1,
+                    'range_id_field': range_id_field1
+                }
+                display_name1 = range_name1[:20] + "..." if len(range_name1) > 20 else range_name1
+                row.append(InlineKeyboardButton(display_name1, callback_data=f"rng_{range_hash1}"))
+                
+                if i + 1 < len(filtered_ranges):
+                    range2 = filtered_ranges[i + 1]
+                    range_name2 = range2.get('pattern', range2.get('name', ''))
+                    # Use range_id (which is now the pattern) as primary identifier
+                    range_id2 = range2.get('range_id') or range2.get('numerical_id') or range_name2
+                    range_id_field2 = range2.get('numerical_id') or range2.get('range_id') or ''
+                    actual_service2 = service_name
+                    
+                    range_hash2 = hashlib.md5(f"{actual_service2}_{range_id2}".encode()).hexdigest()[:12]
+                    context.user_data['range_mapping'][range_hash2] = {
+                        'service': actual_service2,
+                        'range_id': range_id2,
+                        'range_name': range_name2,
+                        'range_id_field': range_id_field2
+                    }
+                    display_name2 = range_name2[:20] + "..." if len(range_name2) > 20 else range_name2
+                    row.append(InlineKeyboardButton(display_name2, callback_data=f"rng_{range_hash2}"))
+                
+                keyboard.append(row)
+            
+            # Back Button
+            if service_name.lower() in ['whatsapp', 'facebook']:
+                 keyboard.append([InlineKeyboardButton("🔙 Back to Countries", callback_data=f"rangechkr_service_{service_name}")])
+            else:
+                 # For Others, just go back to App List for now
+                 keyboard.append([InlineKeyboardButton("🔙 Back to Services", callback_data="rangechkr_service_others")])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            display_service = service_name.upper() if service_name in ['whatsapp', 'facebook'] else service_name
+            await query.edit_message_text(
+                f"📋 {display_service} - {country} ({len(filtered_ranges)} ranges):\nSelect a range:",
+                reply_markup=reply_markup
+            )
+
         except Exception as e:
-            logger.error(f"Error fetching ranges for {service_label}: {e}")
-            await query.edit_message_text(f"❌ Failed to load ranges for {service_label}.")
-            return
+            logger.error(f"Error in rangechkr_country: {e}")
+            await query.edit_message_text(f"❌ Error: {str(e)}")
+
     # Range checker service selection
     elif data.startswith("rangechkr_service_"):
-        service_name = data.split("_")[2]
+        service_name = data.split("_", 2)[2]
         
         # Get global API client
         api_client = get_global_api_client()
@@ -2136,38 +2635,84 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # Handle "others" - first show dynamic service list
+            # Handle "others" - first show dynamic service list (New Flow)
             if service_name == "others":
+                await query.edit_message_text("⏳ Discovering services (this may take a moment)...")
                 try:
-                    with api_lock:
-                        apps = api_client.get_applications()
-                    if not apps:
+                    # Get ranges "others"
+                    ranges = api_client.get_ranges("others")
+                    
+                    if not ranges:
                         await query.edit_message_text("❌ No services found.")
                         return
 
-                    primary_ids = set(SERVICE_APP_IDS.values())
-                    other_apps = []
-                    for app in apps:
-                        app_id = app.get('appId') or app.get('id')
-                        app_name = app.get('name') or app.get('application') or app_id
-                        if app_id and app_id not in primary_ids:
-                            other_apps.append({"id": app_id, "name": app_name})
-
-                    if not other_apps:
-                        await query.edit_message_text("❌ No other services available.")
-                        return
-
-                    context.user_data['rangechkr_other_services'] = other_apps
-
+                    # Aggregate by service
+                    services_found = {} # {service_name: count}
+                    for r in ranges:
+                        svc = r.get('service', 'Other')
+                        if not svc: svc = 'Other'
+                        svc = str(svc).strip()
+                        if svc == "": svc = "Other"
+                        
+                        if svc not in services_found:
+                            services_found[svc] = 0
+                        services_found[svc] += 1
+                    
+                    sorted_services = sorted(services_found.keys())
+                    context.user_data['rangechkr_discovered_services'] = sorted_services
+                    context.user_data['rangechkr_services_dict'] = services_found
+                    
+                    # Pagination: Show 90 services per page (leaving room for navigation buttons)
+                    page = context.user_data.get('rangechkr_others_page', 0)
+                    services_per_page = 90
+                    total_pages = (len(sorted_services) + services_per_page - 1) // services_per_page
+                    
+                    start_idx = page * services_per_page
+                    end_idx = min(start_idx + services_per_page, len(sorted_services))
+                    page_services = sorted_services[start_idx:end_idx]
+                    
                     keyboard = []
-                    for idx, app in enumerate(other_apps):
-                        label = app['name'] or app['id']
-                        keyboard.append([InlineKeyboardButton(label, callback_data=f"rangechkr_serviceapp_{idx}")])
+                    row = []
+                    for idx in range(start_idx, end_idx):
+                        svc = sorted_services[idx]
+                        # Skip primary
+                        if svc.lower() in ['whatsapp', 'facebook']: 
+                            continue
+                        
+                        count = services_found[svc]
+                        label = f"{svc} ({count})"
+                        
+                        # Callback: rangechkr_others_{idx}
+                        row.append(InlineKeyboardButton(label, callback_data=f"rangechkr_others_{idx}"))
+                        
+                        if len(row) == 2:
+                            keyboard.append(row)
+                            row = []
+                    
+                    if row:
+                        keyboard.append(row)
+                    
+                    # Pagination buttons
+                    if total_pages > 1:
+                        nav_row = []
+                        if page > 0:
+                            nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data="rangechkr_others_prev"))
+                        nav_row.append(InlineKeyboardButton(f"📄 {page + 1}/{total_pages}", callback_data="rangechkr_others_noop"))
+                        if page < total_pages - 1:
+                            nav_row.append(InlineKeyboardButton("Next ➡️", callback_data="rangechkr_others_next"))
+                        keyboard.append(nav_row)
+                    
                     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="rangechkr_back_services")])
                     reply_markup = InlineKeyboardMarkup(keyboard)
-                    await query.edit_message_text("📋 Select a service:", reply_markup=reply_markup)
+                    
+                    page_info = f" (Page {page + 1}/{total_pages})" if total_pages > 1 else ""
+                    await query.edit_message_text(
+                        f"📋 Found {len(sorted_services)} Services{page_info}:\nShowing {len(page_services)} services", 
+                        reply_markup=reply_markup
+                    )
                 except Exception as e:
-                    logger.error(f"Error loading applications for rangechkr: {e}")
-                    await query.edit_message_text("❌ Failed to load services. Please try again.")
+                    logger.error(f"Error discovering services: {e}")
+                    await query.edit_message_text(f"❌ Error discovering services.")
                 return
             else:
                 # Handle specific services (WhatsApp, Facebook)
@@ -2183,56 +2728,50 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text(f"❌ No ranges found for {service_name.upper()}.")
                     return
             
-            # Create keyboard with ranges
+            # Group ranges by country - detect from range name if country not available
+            country_ranges = {}
+            for r in ranges:
+                range_name = r.get('name', r.get('id', ''))
+                # Try to get country from API response first
+                country = r.get('cantryName', r.get('country', ''))
+                
+                # If country not found or Unknown, detect from range name
+                if not country or country == 'Unknown' or str(country).strip() == '':
+                    country = detect_country_from_range(range_name)
+                
+                # Only use Unknown as last resort - try harder to detect
+                if not country or country == 'Unknown':
+                    range_str = str(range_name).upper()
+                    for code, country_name in COUNTRY_CODES.items():
+                        if code in range_str or country_name.upper() in range_str:
+                            country = country_name
+                            break
+                
+                # Final fallback
+                if not country:
+                    country = 'Unknown'
+                
+                country_ranges.setdefault(country, []).append(r)
+
+            # Create country buttons - INLINE KEYBOARD
             keyboard = []
-            # Store range mapping in context for this user (using hash to keep callback_data short)
-            if 'range_mapping' not in context.user_data:
-                context.user_data['range_mapping'] = {}
-            
-            # Group ranges in rows of 2
-            for i in range(0, len(ranges), 2):
+            country_list = [c for c in sorted(country_ranges.keys()) if c != 'Unknown']
+            if 'Unknown' in country_ranges and len(country_list) == 0:
+                country_list.append('Unknown')
+
+            for i in range(0, len(country_list), 2):
                 row = []
-                range1 = ranges[i]
-                range_name1 = range1.get('name', range1.get('id', ''))
-                # Use 'name' as primary identifier, fallback to 'id'
-                range_id1 = range1.get('name') or range1.get('id', '')
-                # Also get the 'id' field separately (might be different from name)
-                range_id_field1 = range1.get('id', '')
-                # For "others", get actual service from range's _service field
-                actual_service = range1.get('_service', service_name) if service_name == "others" else service_name
-                # Create short hash for callback_data (max 64 bytes limit)
-                range_hash1 = hashlib.md5(f"{actual_service}_{range_id1}".encode()).hexdigest()[:12]
-                # Store both range_name and range_id (like otp_tool.py)
-                context.user_data['range_mapping'][range_hash1] = {
-                    'service': actual_service,  # Store actual service (e.g., "telegram") not "others"
-                    'range_id': range_id1,
-                    'range_name': range_name1,
-                    'range_id_field': range_id_field1
-                }
-                # Truncate long range names
-                display_name1 = range_name1[:20] + "..." if len(range_name1) > 20 else range_name1
-                row.append(InlineKeyboardButton(display_name1, callback_data=f"rng_{range_hash1}"))
-                
-                if i + 1 < len(ranges):
-                    range2 = ranges[i + 1]
-                    range_name2 = range2.get('name', range2.get('id', ''))
-                    # Use 'name' as primary identifier, fallback to 'id'
-                    range_id2 = range2.get('name') or range2.get('id', '')
-                    # Also get the 'id' field separately (might be different from name)
-                    range_id_field2 = range2.get('id', '')
-                    # For "others", get actual service from range's _service field
-                    actual_service2 = range2.get('_service', service_name) if service_name == "others" else service_name
-                    range_hash2 = hashlib.md5(f"{actual_service2}_{range_id2}".encode()).hexdigest()[:12]
-                    # Store both range_name and range_id (like otp_tool.py)
-                    context.user_data['range_mapping'][range_hash2] = {
-                        'service': actual_service2,  # Store actual service (e.g., "telegram") not "others"
-                        'range_id': range_id2,
-                        'range_name': range_name2,
-                        'range_id_field': range_id_field2
-                    }
-                    display_name2 = range_name2[:20] + "..." if len(range_name2) > 20 else range_name2
-                    row.append(InlineKeyboardButton(display_name2, callback_data=f"rng_{range_hash2}"))
-                
+                flag1 = get_country_flag(country_list[i])
+                row.append(InlineKeyboardButton(
+                    f"{flag1} {country_list[i]}",
+                    callback_data=f"rangechkr_country_{service_name}_{country_list[i]}"
+                ))
+                if i + 1 < len(country_list):
+                    flag2 = get_country_flag(country_list[i + 1])
+                    row.append(InlineKeyboardButton(
+                        f"{flag2} {country_list[i + 1]}",
+                        callback_data=f"rangechkr_country_{service_name}_{country_list[i + 1]}"
+                    ))
                 keyboard.append(row)
             
             keyboard.append([InlineKeyboardButton("🔙 Back to Services", callback_data="rangechkr_back_services")])
@@ -2240,7 +2779,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             display_service_name = "Others" if service_name == "others" else service_name.upper()
             await query.edit_message_text(
-                f"📋 {display_service_name} Ranges ({len(ranges)} available):\n\nSelect a range:",
+                f"📋 {display_service_name} - Select Country:",
                 reply_markup=reply_markup
             )
         except Exception as e:
@@ -2444,6 +2983,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("💬 WhatsApp", callback_data="rangechkr_service_whatsapp")],
             [InlineKeyboardButton("👥 Facebook", callback_data="rangechkr_service_facebook")],
+            [InlineKeyboardButton("✈️ Telegram", callback_data="rangechkr_service_telegram")],
             [InlineKeyboardButton("✨ Others", callback_data="rangechkr_service_others")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2457,6 +2997,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("💬 WhatsApp", callback_data="service_whatsapp")],
             [InlineKeyboardButton("👥 Facebook", callback_data="service_facebook")],
+            [InlineKeyboardButton("✈️ Telegram", callback_data="service_telegram")],
             [InlineKeyboardButton("✨ Others", callback_data="service_others")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2481,6 +3022,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("💬 WhatsApp", callback_data="service_whatsapp")],
             [InlineKeyboardButton("👥 Facebook", callback_data="service_facebook")],
+            [InlineKeyboardButton("✈️ Telegram", callback_data="service_telegram")],
             [InlineKeyboardButton("✨ Others", callback_data="service_others")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
