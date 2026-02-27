@@ -9,6 +9,9 @@ import requests
 import json
 import re
 import hashlib
+import html
+import unicodedata
+from functools import partial
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Conflict
@@ -19,6 +22,23 @@ from flask import Flask
 
 # Load environment variables
 load_dotenv()
+
+
+def require_env(name: str) -> str:
+    """Read required env var and fail fast with clear message."""
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"{name} environment variable is required.")
+    return value.strip()
+
+
+def require_int_env(name: str) -> int:
+    """Read required integer env var and validate format."""
+    raw = require_env(name)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid integer, got: {raw!r}") from exc
 
 # Try to import cloudscraper for Cloudflare bypass
 try:
@@ -48,21 +68,19 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
-# Bot Configuration (from environment variables only - no default value)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required. Please set it in Render environment variables.")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5742928021"))
-OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1003403204287"))  # Channel ID for forwarding OTP messages
+# Bot Configuration (required env vars)
+BOT_TOKEN = require_env("BOT_TOKEN")
+ADMIN_USER_ID = require_int_env("ADMIN_USER_ID")
+OTP_CHANNEL_ID = require_int_env("OTP_CHANNEL_ID")  # Channel ID for forwarding OTP messages
 
 # API Configuration (from otp_tool.py)
 BASE_URL = "https://stexsms.com"
-API_EMAIL = os.getenv("API_EMAIL", "roni791158@gmail.com")
-API_PASSWORD = os.getenv("API_PASSWORD", "53561106@Roni")
+API_EMAIL = require_env("API_EMAIL")
+API_PASSWORD = require_env("API_PASSWORD")
 
-# Supabase Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://sgnnqvfoajqsfdyulolm.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNnbm5xdmZvYWpxc2ZkeXVsb2xtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQxNzE1MjcsImV4cCI6MjA3OTc0NzUyN30.dFniV0odaT-7bjs5iQVFQ-N23oqTGMAgQKjswhaHSP4")
+# Supabase Configuration (required env vars)
+SUPABASE_URL = require_env("SUPABASE_URL")
+SUPABASE_KEY = require_env("SUPABASE_KEY")
 
 # Supabase Database setup
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -86,13 +104,57 @@ def init_database():
 # Initialize database on import
 init_database()
 
+class BestEffortLock:
+    """Non-blocking-ish lock to avoid freezing the event loop under contention."""
+    def __init__(self, timeout=0.05):
+        self._lock = threading.Lock()
+        self._timeout = timeout
+        self._acquired = False
+
+    def __enter__(self):
+        try:
+            self._acquired = self._lock.acquire(timeout=self._timeout)
+        except Exception:
+            self._acquired = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._acquired:
+            try:
+                self._lock.release()
+            except Exception:
+                pass
+        self._acquired = False
+        return False
+
 # Global locks for thread safety
-db_lock = threading.Lock()
+db_lock = BestEffortLock(timeout=0.05)
 user_jobs = {}  # Store latest monitoring job per user (older jobs may still run)
+console_lock = threading.Lock()
+console_bootstrapped = False
+forwarded_console_ids = set()
+forwarded_console_order = []
+MAX_FORWARDED_CONSOLE_IDS = 5000
+bot_username_cache = None
+CONSOLE_MONITOR_INTERVAL = int(os.getenv("CONSOLE_MONITOR_INTERVAL", "3"))
+CONSOLE_MAX_FORWARDS_PER_CYCLE = int(os.getenv("CONSOLE_MAX_FORWARDS_PER_CYCLE", "6"))
+CONSOLE_CYCLE_BUDGET_SECONDS = float(os.getenv("CONSOLE_CYCLE_BUDGET_SECONDS", "2.2"))
+# Console stream -> OTP channel forwarding is limited to these services for now.
+CONSOLE_FORWARD_SERVICE_KEYS = {"whatsapp", "telegram"}
 
 # Global API client - single session for all users
 global_api_client = None
 api_lock = threading.Lock()
+API_IO_WORKERS = int(os.getenv("API_IO_WORKERS", "120"))
+api_io_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(16, API_IO_WORKERS),
+    thread_name_prefix="api-io"
+)
+
+async def run_api_call(func, *args, **kwargs):
+    """Run blocking API call in thread pool to keep event loop responsive."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(api_io_executor, partial(func, *args, **kwargs))
 
 def get_global_api_client():
     """Get or create global API client (single session for all users)"""
@@ -167,15 +229,14 @@ def get_user_status(user_id):
         return 'pending'
 
 def add_user(user_id, username):
-    """Add new user to database (Auto-approved)"""
+    """Add new user to database"""
     try:
         with db_lock:
             # Use integer user_id (BIGINT in database)
             supabase.table('users').upsert({
                 'user_id': int(user_id),
                 'username': username,
-                'status': 'approved',
-                'approved_at': datetime.now().isoformat()
+                'status': 'pending'
             }).execute()
     except Exception as e:
         logger.error(f"Error adding user: {e}")
@@ -434,7 +495,7 @@ class APIClient:
             "Sec-Fetch-Dest": "empty"
         }
         self._ranges_cache = {}  # Cache structure: {app_id: {'timestamp': time.time(), 'data': [...]}}
-        self._cache_duration = 300  # 5 minutes cache
+        self._cache_duration = int(os.getenv("RANGES_CACHE_SECONDS", "30"))
         
         # Internal lock for thread safety (login/token refresh)
         self._lock = threading.Lock()
@@ -452,7 +513,7 @@ class APIClient:
             try:
                 login_headers = {
                     **self.browser_headers,
-                    "Referer": f"{self.base_url}/mdashboard/access"
+                    "Referer": f"{self.base_url}/mdashboard/getnum"
                 }
                 # Hypothesized login endpoint
                 login_url = f"{self.base_url}/mapi/v1/mauth/login"
@@ -496,226 +557,164 @@ class APIClient:
                 logger.error(traceback.format_exc())
                 return False
     
-    def _fetch_ranges_with_keyword(self, app_id, keyword, use_origin=True, prefix=""):
-        """Helper to fetch ranges with a specific keyword"""
-        try:
-            if not self.auth_token:
-                return []
-            
-            headers = {
-                **self.browser_headers,
-                "mauthtoken": self.auth_token,
-                "Referer": f"{self.base_url}/mdashboard/access"
-            }
-            
-            # Build payload based on whether to use origin filter
-            payload = {
-                "prefix": prefix,
-                "keyword": keyword
-            }
-            
-            # Only add origin if use_origin is True (for WhatsApp/Facebook)
-            if use_origin:
-                payload["origin"] = app_id
-            else:
-                payload["origin"] = ""  # Blank for Others
-            
-            # Implementation of retry logic for token expiration
-            max_fetches = 2
-            for attempt in range(max_fetches):
-                # Update token in headers (in case it was refreshed)
-                if self.auth_token:
-                    headers["mauthtoken"] = self.auth_token
+    def _normalize_range_token(self, value):
+        """Normalize any range-like token to [0-9X] uppercase text."""
+        if value is None:
+            return ""
+        return re.sub(r'[^0-9Xx]', '', str(value)).upper()
 
-                resp = self.session.post(
-                    f"{self.base_url}/mapi/v1/mdashboard/access/info",
-                    json=payload,
-                    headers=headers,
-                    timeout=15
-                )
-                
-                # Check for token expiration
-                if resp.status_code in [401, 403] or "unauthorized" in resp.text.lower():
-                    logger.warning(f"Token expired (Status {resp.status_code}), refreshing...")
-                    self.auth_token = None
-                    if self.login():
-                        # Retry loop will pick up new token
-                        continue
-                    else:
-                        return [] # Login failed
-                
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, dict) and 'data' in data and isinstance(data['data'], list):
-                        ranges = []
-                        for item in data['data']:
-                            destination = item.get('destination', 'Unknown')
-                            country = destination.split('-')[0].strip() if '-' in destination else destination
-                            
-                            range_val = item.get('test_number')
-                            if range_val:
-                                range_obj = {
-                                    'id': range_val,  # Pattern like "9965579XXX" - PRIMARY identifier
-                                    'numerical_id': str(item.get('id')),  # Numerical ID for reference only
-                                    'range_id': range_val,  # Use pattern as range_id (API expects this)
-                                    'name': range_val,
-                                    'pattern': range_val,
-                                    'country': country,
-                                    'cantryName': country,
-                                    'operator': destination,
-                                    'limit_day': item.get('limit_day'),
-                                    'limit_hour': item.get('limit_hour'),
-                                    'datetime': item.get('datetime', '')  # Extract timestamp (e.g., "7 mins ago")
-                                }
-                                
-                                # For Others service, include the actual service name from API
-                                if not use_origin:
-                                    service_name = item.get('origin', 'Unknown')
-                                    range_obj['service'] = service_name
-                                    # Append service to operator for display
-                                    range_obj['operator'] = f"{destination} ({service_name})"
-                                
-                                ranges.append(range_obj)
-                        return ranges
+    def _normalize_country(self, raw_country, range_token="", number_token=""):
+        """Prefer explicit country; fallback to number/range based detection."""
+        country = str(raw_country or "").strip()
+        generic_labels = {"unknown", "other", "postpaid", "prepaid"}
+        if country and country.lower() not in generic_labels:
+            return country
+
+        detected = (
+            detect_country_from_range(range_token)
+            or detect_country_from_number(number_token)
+            or detect_country_from_range(number_token)
+        )
+        return detected or "Unknown"
+
+    def _build_ranges_from_console_logs(self, logs):
+        """
+        Build deduplicated range objects from console stream.
+        This replaces old /mdashboard/access scraping.
+        """
+        if not isinstance(logs, list) or not logs:
             return []
-        except Exception as e:
-            logger.warning(f"Error fetching with keyword '{keyword}': {e}")
-            return []
+
+        primary_services = {"whatsapp", "facebook", "telegram"}
+        primary_labels = {
+            "whatsapp": "WhatsApp",
+            "facebook": "Facebook",
+            "telegram": "Telegram",
+        }
+
+        range_map = {}
+
+        for idx, item in enumerate(logs):
+            if not isinstance(item, dict):
+                continue
+
+            app_name_raw = str(item.get('app_name') or "").strip()
+            if not app_name_raw:
+                continue
+
+            service_key = normalize_service_name(app_name_raw)
+            service_label = primary_labels.get(service_key, app_name_raw)
+
+            raw_range = self._normalize_range_token(item.get('range'))
+            raw_number = self._normalize_range_token(item.get('number'))
+
+            range_token = raw_range or raw_number
+            if not range_token:
+                continue
+
+            # getnum/number usually accepts pattern form; force XXX suffix when missing.
+            range_for_api = range_token if 'X' in range_token else f"{range_token}XXX"
+
+            # Ignore clearly invalid short prefixes.
+            if len(re.sub(r'[^0-9]', '', range_for_api)) < 4:
+                continue
+
+            country = self._normalize_country(item.get('country'), range_for_api, raw_number)
+            carrier = str(item.get('carrier') or "Unknown").strip() or "Unknown"
+            log_id = item.get('id')
+
+            # Existing UI sort expects "X mins ago" style text.
+            datetime_label = f"{idx} mins ago"
+
+            obj = {
+                'id': range_for_api,
+                'numerical_id': str(log_id) if log_id is not None else "",
+                'range_id': range_for_api,
+                'name': range_for_api,
+                'pattern': range_for_api,
+                'country': country,
+                'cantryName': country,
+                'operator': carrier,
+                'service': service_label,
+                'datetime': datetime_label,
+            }
+
+            # Keep newest occurrence per (service, range).
+            map_key = (service_label.lower(), range_for_api)
+            if map_key not in range_map:
+                range_map[map_key] = obj
+            else:
+                existing = range_map[map_key]
+                if existing.get('country') in {"Unknown", "Other", "postpaid", "prepaid"} and country not in {"Unknown", "Other", "postpaid", "prepaid"}:
+                    range_map[map_key] = obj
+
+        # Keep deterministic ordering by freshness first.
+        ranges = list(range_map.values())
+        ranges.sort(key=lambda x: parse_time_ago(x.get('datetime', '')))
+
+        # Drop exact duplicate range IDs to keep UI cleaner.
+        seen_ids = set()
+        unique_ranges = []
+        for r in ranges:
+            rid = str(r.get('range_id') or r.get('name') or "")
+            sid = str(r.get('service') or "").lower()
+            dedupe_key = (sid, rid)
+            if dedupe_key in seen_ids:
+                continue
+            seen_ids.add(dedupe_key)
+            unique_ranges.append(r)
+
+        # Filter out blank service rows from "others" view stability perspective.
+        return [r for r in unique_ranges if str(r.get('service') or "").strip()]
 
     def get_ranges(self, app_id, max_retries=3, keyword=""):
-        """Get ranges for application - Service-specific keyword strategy"""
+        """Get ranges using new getnum-era console stream metadata."""
         try:
             if not self.auth_token:
                 if not self.login():
                     return []
-            
-            # Check cache first
-            cache_key = f"{app_id}_multi"
+
+            app_id_norm = str(app_id or "").strip().lower()
+            cache_key = f"ranges_console::{app_id_norm}"
+            now_ts = time.time()
+
             if cache_key in self._ranges_cache:
                 entry = self._ranges_cache[cache_key]
-                if time.time() - entry['timestamp'] < self._cache_duration:
-                    logger.info(f"Returning cached ranges for {app_id}")
+                if now_ts - entry['timestamp'] < self._cache_duration:
                     return entry['data']
-            
-            # Determine if this is WhatsApp/Facebook/Telegram or Others
-            is_specific_service = app_id.lower() in ['whatsapp', 'facebook', 'telegram']
-            
-            # Keywords for WhatsApp/Facebook (with origin filter)
-            specific_keywords = [
-                app_id,           # Service name itself
-                "code",           # Verification code
-                "whatsapp",       # WhatsApp specific
-                "business",       # Business accounts
-                "otp",            # One-time password
-                "verify",         # Verification
-                "authentication", # Auth messages
-                "login",          # Login codes
-                "sms",            # SMS messages
-                "",               # Empty for general
-            ]
-            
-            # Keywords for Others (no origin filter - broader search)
-            others_keywords = [
-                "verification", "code", "otp", "verify", "sms", "message", "auth", "login",
-                "conf", "confirm", "pin", "secure", "access", "validate", "check", "pass",
-                "password", "text", "msg", "notification", "notify", "info", "alert", "update",
-                "app", "web", "net", "com", "org", "verify-code", "any", "vantage", ""
-            ]
-            
-            # Select keywords and origin usage based on service type
-            if is_specific_service:
-                keywords = specific_keywords
-                use_origin = True
-            elif app_id.lower() == "others":
-                keywords = others_keywords
-                use_origin = False
-            else:
-                # Specific other service (e.g. Google, Instagram)
-                # Search using the service name itself WITHOUT origin filter
-                # This matches the discovery behavior and is more compatible
-                keywords = [app_id]
-                use_origin = False
-            
-            all_ranges = []
-            unique_range_names = set()  # Use range name (phone number) for deduplication, not range_id
-            
-            # Fallback strategy for specific other services
-            if not is_specific_service and app_id.lower() != "others":
-                # Try specific keyword first (Fast)
-                keywords_list = [[app_id]]
-                # If that fails, we might need to fallback to broad search
-                # But broad search is slow (30 requests). 
-                # Let's try to be smart - maybe just try generic 'code', 'otp' if specific fails?
-                # Actually, let's just stick to specific first. If it returns 0, we can decide.
-                # However, for now, let's use the provided logic:
-                keywords = [app_id]
-            
-            all_ranges = []
-            unique_range_names = set()
-            
-            # Helper to run search
-            def run_search(kw_list):
-                found_count = 0
-                for kw in kw_list:
-                    ranges = self._fetch_ranges_with_keyword(app_id, kw, use_origin)
-                    if ranges and found_count == 0:
-                         # Log keys of first item for debugging (timestamp analysis)
-                         logger.info(f"DEBUG: Item keys: {list(ranges[0].keys())}")
-                         
-                    for r in ranges:
-                        range_name = r['name']
-                        if range_name not in unique_range_names:
-                            # Client-side filter
-                            if not is_specific_service and app_id.lower() != "others":
-                                range_service = r.get('service', '').strip()
-                                if range_service and app_id.lower() not in range_service.lower():
-                                    logger.info(f"Skipping range {range_name} (service={range_service}) for app_id={app_id}")
-                                    continue
-                                logger.info(f"Including range {range_name} (service={range_service}) for app_id={app_id}")
-                            
-                            unique_range_names.add(range_name)
-                            all_ranges.append(r)
-                            found_count += 1
-                return found_count
 
-            # Execute search
-            count = run_search(keywords)
-            
-            # Fallback for Others: If specific search yielded 0 results, try broad search
-            if count == 0 and not is_specific_service and app_id.lower() != "others":
-                logger.info(f"Specific search for '{app_id}' yielded 0 results. Falling back to broad search...")
-                # Use a subset of most likely keywords to save time, or full list?
-                # Full list is safer but slower. 
-                count = run_search(others_keywords)
+            logs = self.get_console_logs()
+            all_ranges = self._build_ranges_from_console_logs(logs)
+            if not all_ranges:
+                logger.warning(f"No ranges available from console source for app_id={app_id}")
+                self._ranges_cache[cache_key] = {'timestamp': now_ts, 'data': []}
+                return []
 
-            
-            # Extra searches for specific WhatsApp prefixes
-            if is_specific_service and 'whatsapp' in app_id.lower():
-                prefixes = ["225", "228", "229", "232", "236", "237", "244", "261", "977"]
-                logger.info(f"Fetching extra ranges for WhatsApp prefixes: {prefixes}")
-                for pfx in prefixes:
-                    ranges = self._fetch_ranges_with_keyword(app_id, "", use_origin, prefix=pfx)
-                    count = 0
-                    for r in ranges:
-                        range_name = r['name']
-                        if range_name not in unique_range_names:
-                            unique_range_names.add(range_name)
-                            all_ranges.append(r)
-                            count += 1
-                    if count > 0:
-                         logger.info(f"Prefix {pfx}: Found {count} new ranges")
+            primary_services = {"whatsapp", "facebook", "telegram"}
+            filtered = []
 
-            logger.info(f"Found {len(all_ranges)} unique ranges for {app_id} using {len(keywords)} keywords (origin_filter={use_origin})")
-            
-            # Update cache only if we found ranges
-            if len(all_ranges) > 0:
-                self._ranges_cache[cache_key] = {
-                    'timestamp': time.time(),
-                    'data': all_ranges
-                }
-            
-            return all_ranges
-            
+            for r in all_ranges:
+                service_label = str(r.get('service') or "").strip()
+                if not service_label:
+                    continue
+
+                service_norm = normalize_service_name(service_label)
+                service_lower = service_label.lower()
+
+                if app_id_norm in primary_services:
+                    if service_norm == app_id_norm:
+                        filtered.append(r)
+                elif app_id_norm == "others":
+                    if service_norm not in primary_services:
+                        filtered.append(r)
+                else:
+                    if app_id_norm in service_lower or service_lower in app_id_norm:
+                        filtered.append(r)
+
+            self._ranges_cache[cache_key] = {'timestamp': now_ts, 'data': filtered}
+            logger.info(f"Found {len(filtered)} ranges for {app_id} from new console source")
+            return filtered
+
         except Exception as e:
             logger.error(f"Error getting ranges: {e}")
             return []
@@ -739,41 +738,69 @@ class APIClient:
             if not self.auth_token:
                 if not self.login():
                     return None
-            
-            headers = {
-                **self.browser_headers,
-                "mauthtoken": self.auth_token,
-                "Referer": f"{self.base_url}/mdashboard/getnum?range={range_id}"
-            }
-            
-            # New API: POST /mapi/v1/mdashboard/getnum/number
-            payload = {
-                "range": range_id,
-                "is_national": False,
-                "remove_plus": False
-            }
-            
-            resp = self.session.post(
-                f"{self.base_url}/mapi/v1/mdashboard/getnum/number",
-                json=payload,
-                headers=headers,
-                timeout=15
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if 'data' in data:
-                    number_data = data['data']
-                    # Response: {"data":{"number":"+937...", ...}}
-                    if isinstance(number_data, dict):
-                        if 'number' in number_data:
-                            return number_data
-                        # Handle potential alias
-                        if 'copy' in number_data:
-                            number_data['number'] = number_data['copy']
-                            return number_data
-            
-            logger.warning(f"get_number failed: {resp.text[:200]}")
+
+            normalized = self._normalize_range_token(range_id)
+            if not normalized:
+                return None
+
+            candidates = []
+            if 'X' in normalized:
+                candidates.append(normalized)
+            else:
+                candidates.append(f"{normalized}XXX")
+                candidates.append(normalized)
+
+            # Keep order and remove duplicates.
+            dedup_candidates = []
+            seen = set()
+            for c in candidates:
+                if c not in seen:
+                    seen.add(c)
+                    dedup_candidates.append(c)
+
+            for candidate_range in dedup_candidates:
+                headers = {
+                    **self.browser_headers,
+                    "mauthtoken": self.auth_token,
+                    "Referer": f"{self.base_url}/mdashboard/getnum?range={candidate_range}"
+                }
+
+                payload = {
+                    "range": candidate_range,
+                    "is_national": False,
+                    "remove_plus": False
+                }
+
+                resp = self.session.post(
+                    f"{self.base_url}/mapi/v1/mdashboard/getnum/number",
+                    json=payload,
+                    headers=headers,
+                    timeout=15
+                )
+
+                if resp.status_code in [401, 403]:
+                    self.auth_token = None
+                    if self.login():
+                        headers["mauthtoken"] = self.auth_token
+                        resp = self.session.post(
+                            f"{self.base_url}/mapi/v1/mdashboard/getnum/number",
+                            json=payload,
+                            headers=headers,
+                            timeout=15
+                        )
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if 'data' in data:
+                        number_data = data['data']
+                        if isinstance(number_data, dict):
+                            if 'number' in number_data:
+                                return number_data
+                            if 'copy' in number_data:
+                                number_data['number'] = number_data['copy']
+                                return number_data
+
+            logger.warning(f"get_number failed for range={range_id}")
             return None
         except Exception as e:
             logger.error(f"Error getting number: {e}")
@@ -957,6 +984,43 @@ class APIClient:
         except Exception as e:
             logger.error(f"Error checking OTP batch: {e}")
             return {}
+
+    def get_console_logs(self):
+        """Get latest masked OTP logs from console endpoint."""
+        try:
+            if not self.auth_token:
+                if not self.login():
+                    return []
+
+            headers = {
+                **self.browser_headers,
+                "mauthtoken": self.auth_token,
+                "Referer": f"{self.base_url}/mdashboard/console",
+                "Accept": "application/json, text/plain, */*"
+            }
+
+            url = f"{self.base_url}/mapi/v1/mdashboard/console/info"
+            resp = self.session.get(url, headers=headers, timeout=10)
+
+            if resp.status_code in [401, 403]:
+                logger.info("Token expired in get_console_logs, refreshing...")
+                if self.login():
+                    headers["mauthtoken"] = self.auth_token
+                    resp = self.session.get(url, headers=headers, timeout=10)
+                else:
+                    return []
+
+            if resp.status_code != 200:
+                logger.warning(f"get_console_logs failed: status={resp.status_code} body={resp.text[:200]}")
+                return []
+
+            payload = resp.json()
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            logs = data.get("logs", []) if isinstance(data, dict) else []
+            return logs if isinstance(logs, list) else []
+        except Exception as e:
+            logger.error(f"Error getting console logs: {e}")
+            return []
 
 # Global API client - single session for all users
 global_api_client = None
@@ -1250,6 +1314,219 @@ def get_country_code(country_name):
     
     return 'XX'
 
+def detect_country_from_number(number):
+    """Detect country name from number prefix."""
+    if not number:
+        return None
+
+    digits = ''.join(filter(str.isdigit, str(number)))
+    for code_len in [3, 2, 1]:
+        if len(digits) >= code_len:
+            code = digits[:code_len]
+            if code in COUNTRY_CODES:
+                return COUNTRY_CODES[code]
+    return None
+
+def _sanitize_start_token(value, max_len=48):
+    """Keep only deep-link safe chars."""
+    if not value:
+        return ""
+    return re.sub(r'[^A-Za-z0-9]', '', str(value))[:max_len]
+
+def infer_range_from_number(number):
+    """Best-effort range guess from a phone number."""
+    digits = ''.join(filter(str.isdigit, str(number or "")))
+    if len(digits) >= 7:
+        return f"{digits[:-3]}XXX"
+    return digits or None
+
+def normalize_service_name(service_name):
+    """Normalize service text to internal key."""
+    if not service_name:
+        return None
+
+    normalized = re.sub(r'[^a-z0-9]+', '', str(service_name).lower())
+    if "whatsapp" in normalized:
+        return "whatsapp"
+    if "facebook" in normalized:
+        return "facebook"
+    if "telegram" in normalized:
+        return "telegram"
+    return None
+
+def build_range_start_payload(range_value, service_name=None):
+    """Build /start deep-link payload for range."""
+    range_token = _sanitize_start_token(range_value, max_len=40).upper()
+    if not range_token:
+        return None
+
+    service_token = _sanitize_start_token(service_name, max_len=12).lower()
+    if service_token:
+        return f"rng_{range_token}_{service_token}"
+    return f"rng_{range_token}"
+
+def parse_range_start_payload(payload):
+    """Parse deep-link payload -> (range_value, service_hint)."""
+    if not payload or not payload.startswith("rng_"):
+        return None, None
+
+    rest = payload[4:]
+    if "_" in rest:
+        range_part, service_part = rest.split("_", 1)
+    else:
+        range_part, service_part = rest, ""
+
+    range_value = _sanitize_start_token(range_part, max_len=40).upper()
+    service_hint = _sanitize_start_token(service_part, max_len=12).lower() or None
+
+    if not range_value:
+        return None, None
+
+    return range_value, service_hint
+
+async def build_range_deeplink(context: ContextTypes.DEFAULT_TYPE, range_value, service_name=None):
+    """Build t.me deep link URL for opening bot with range payload."""
+    global bot_username_cache
+
+    payload = build_range_start_payload(range_value, service_name)
+    if not payload:
+        return None
+
+    if not bot_username_cache:
+        try:
+            me = await context.bot.get_me()
+            bot_username_cache = me.username
+        except Exception as e:
+            logger.warning(f"Unable to resolve bot username for range link: {e}")
+            return None
+
+    if not bot_username_cache:
+        return None
+
+    return f"https://t.me/{bot_username_cache}?start={payload}"
+
+async def send_numbers_from_range_link(update: Update, context: ContextTypes.DEFAULT_TYPE, range_value, service_hint=None):
+    """Fetch numbers for a deep-link range and start OTP monitor."""
+    user_id = update.effective_user.id
+    api_client = get_global_api_client()
+    if not api_client:
+        await update.message.reply_text("❌ API connection error. Please try again.")
+        return
+
+    session = get_user_session(user_id)
+    number_count = session.get('number_count', 2) if session else 2
+    base_range = _sanitize_start_token(range_value, max_len=40).upper()
+
+    if len(base_range) < 4:
+        await update.message.reply_text("❌ Invalid range.")
+        return
+
+    # Fast path for range-button links: console ranges often come without XXX.
+    # Try the pattern form first to avoid slow retries on invalid raw prefixes.
+    candidates = [base_range]
+    if 'X' not in base_range:
+        candidates = [f"{base_range}XXX", base_range]
+
+    numbers_data = None
+    selected_range = None
+    for candidate in candidates:
+        response = await run_api_call(api_client.get_multiple_numbers, candidate, candidate, number_count)
+        if response:
+            numbers_data = response
+            selected_range = candidate
+            break
+
+    if not numbers_data:
+        await update.message.reply_text(f"❌ Failed to get numbers for range {base_range}.")
+        return
+
+    numbers_list = []
+    for num_data in numbers_data:
+        number = num_data.get('number', '')
+        if number:
+            numbers_list.append(number)
+
+    if not numbers_list:
+        await update.message.reply_text("❌ No valid numbers received. Please try again.")
+        return
+
+    country_name = detect_country_from_number(numbers_list[0]) or detect_country_from_range(selected_range) or 'Unknown'
+    found_service = (
+        normalize_service_name(service_hint)
+        or normalize_service_name(session.get('service') if session else None)
+        or "whatsapp"
+    )
+
+    keyboard = []
+    for num in numbers_list:
+        keyboard.append([InlineKeyboardButton(
+            f"📱 {num}",
+            api_kwargs={"copy_text": {"text": num}}
+        )])
+
+    # Allow fetching fresh numbers from the same range via existing rng_ callback flow.
+    context.user_data.setdefault('range_mapping', {})
+    change_hash = hashlib.md5(f"{found_service}_{selected_range}".encode()).hexdigest()[:12]
+    context.user_data['range_mapping'][change_hash] = {
+        'service': found_service,
+        'range_id': selected_range,
+        'range_name': selected_range
+    }
+    keyboard.append([InlineKeyboardButton("🔄 Change Numbers", callback_data=f"rng_{change_hash}")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    country_flag = get_country_flag(country_name)
+    service_icons = {
+        "whatsapp": "💬",
+        "facebook": "👥",
+        "telegram": "✈️"
+    }
+    service_icon = service_icons.get(found_service, "📱")
+    message_text = (
+        f"{service_icon} {found_service.upper()}\n"
+        f"{country_flag} {country_name}\n"
+        f"📋 Range: {selected_range}\n\n"
+        f"✅ {len(numbers_list)} numbers received:\n\n"
+        "Tap a number to copy it."
+    )
+
+    sent_msg = await update.message.reply_text(
+        message_text,
+        reply_markup=reply_markup
+    )
+
+    update_user_session(
+        user_id,
+        service=found_service,
+        country=country_name,
+        range_id=selected_range,
+        number=','.join(numbers_list),
+        monitoring=1
+    )
+
+    if user_id in user_jobs:
+        user_jobs[user_id].schedule_removal()
+
+    if context.job_queue:
+        job_data = {
+            'user_id': user_id,
+            'numbers': numbers_list,
+            'service': found_service,
+            'range_id': selected_range,
+            'start_time': time.time(),
+            'message_id': sent_msg.message_id
+        }
+        if country_name and country_name != 'Unknown':
+            job_data['country'] = country_name
+
+        job = context.job_queue.run_repeating(
+            monitor_otp,
+            interval=3,
+            first=5,
+            data=job_data
+        )
+        user_jobs[user_id] = job
+
 def sort_numbers_for_ivory_coast(numbers_list, country_name):
     """
     Sort numbers for Ivory Coast - prioritize numbers starting with 22507
@@ -1321,194 +1598,304 @@ def mask_number(number):
     
     return masked
 
+def _strip_accents(text):
+    """Normalize latin accents for matching."""
+    return ''.join(
+        ch for ch in unicodedata.normalize('NFKD', text)
+        if not unicodedata.combining(ch)
+    )
+
+
+def _detect_language_by_script(text):
+    """Fast script-based detection for non-latin SMS bodies."""
+    counts = {
+        'arabic': 0,
+        'cyrillic': 0,
+        'greek': 0,
+        'hebrew': 0,
+        'devanagari': 0,
+        'bengali': 0,
+        'thai': 0,
+        'hangul': 0,
+        'kana': 0,
+        'cjk': 0,
+    }
+    total_letters = 0
+
+    for ch in text:
+        if ch.isalpha():
+            total_letters += 1
+        cp = ord(ch)
+        if 0x0600 <= cp <= 0x06FF or 0x0750 <= cp <= 0x077F or 0x08A0 <= cp <= 0x08FF:
+            counts['arabic'] += 1
+        elif 0x0400 <= cp <= 0x052F:
+            counts['cyrillic'] += 1
+        elif 0x0370 <= cp <= 0x03FF:
+            counts['greek'] += 1
+        elif 0x0590 <= cp <= 0x05FF:
+            counts['hebrew'] += 1
+        elif 0x0900 <= cp <= 0x097F:
+            counts['devanagari'] += 1
+        elif 0x0980 <= cp <= 0x09FF:
+            counts['bengali'] += 1
+        elif 0x0E00 <= cp <= 0x0E7F:
+            counts['thai'] += 1
+        elif 0x1100 <= cp <= 0x11FF or 0xAC00 <= cp <= 0xD7AF:
+            counts['hangul'] += 1
+        elif 0x3040 <= cp <= 0x30FF:
+            counts['kana'] += 1
+        elif 0x4E00 <= cp <= 0x9FFF:
+            counts['cjk'] += 1
+
+    if total_letters == 0:
+        return None
+
+    script, count = max(counts.items(), key=lambda kv: kv[1])
+    # Require a minimum absolute/relative dominance to avoid mixed-text false positives.
+    if count < 3 or (count / total_letters) < 0.45:
+        return None
+
+    mapping = {
+        'arabic': 'Arabic',
+        'cyrillic': 'Russian',
+        'greek': 'Greek',
+        'hebrew': 'Hebrew',
+        'devanagari': 'Hindi',
+        'bengali': 'Bengali',
+        'thai': 'Thai',
+        'hangul': 'Korean',
+        'kana': 'Japanese',
+        'cjk': 'Chinese',
+    }
+    return mapping.get(script)
+
+
 def detect_language_from_sms(sms_content):
-    """Detect language from SMS content"""
+    """Detect SMS language with script + weighted OTP phrase matching."""
     if not sms_content:
         return 'Unknown'
-    
-    sms_lower = sms_content.lower()
-    
-    # Common language indicators
-    # NOTE: "code" is too generic (exists in many languages). We prefer longer phrases / accented words.
-    language_keywords = {
-        'English': ['your code is', 'verification code', 'otp', 'one-time password', 'do not share', 'verify', 'confirm', 'code is', 'code'],
-        'French': ['votre code est', 'vérification', 'vérifier', 'mot de passe', 'confirmer', 'connexion', 'sécurité', 'ne partagez pas'],
-        'Spanish': ['tu código es', 'código', 'verificación', 'contraseña', 'confirmar', 'verificar'],
-        'German': ['dein code ist', 'ihr code ist', 'bestätigung', 'passwort', 'bestätigen', 'verifizieren'],
-        'Italian': ['codice', 'verifica', 'password', 'confermare', 'verificare', 'il tuo codice è'],
-        'Portuguese': ['código', 'verificação', 'senha', 'confirmar', 'verificar', 'seu código é'],
-        'Russian': ['код', 'подтверждение', 'пароль', 'подтвердить', 'проверить', 'ваш код'],
-        'Arabic': ['رمز', 'التحقق', 'كلمة المرور', 'تأكيد', 'التحقق من', 'رمزك هو'],
-        'Hindi': ['कोड', 'सत्यापन', 'पासवर्ड', 'पुष्टि', 'सत्यापित', 'आपका कोड है'],
-        'Bengali': ['কোড', 'যাচাইকরণ', 'পাসওয়ার্ড', 'নিশ্চিত', 'যাচাই', 'আপনার কোড'],
-        'Chinese': ['代码', '验证', '密码', '确认', '验证', '您的代码是'],
-        'Japanese': ['コード', '確認', 'パスワード', '確認する', '検証', 'あなたのコードは'],
-        'Korean': ['코드', '확인', '비밀번호', '확인하다', '검증', '귀하의 코드는'],
-        'Turkish': ['kod', 'doğrulama', 'şifre', 'onayla', 'doğrula', 'kodunuz'],
-        'Dutch': ['uw code is', 'verificatie', 'wachtwoord', 'bevestigen', 'verifiëren'],
-        'Polish': ['kod', 'weryfikacja', 'hasło', 'potwierdź', 'zweryfikuj', 'twój kod to'],
-        'Thai': ['รหัส', 'การยืนยัน', 'รหัสผ่าน', 'ยืนยัน', 'ตรวจสอบ', 'รหัสของคุณคือ'],
-        'Vietnamese': ['mã', 'xác minh', 'mật khẩu', 'xác nhận', 'xác minh', 'mã của bạn là'],
-        'Indonesian': ['kode', 'verifikasi', 'kata sandi', 'konfirmasi', 'verifikasi', 'kode anda adalah'],
-        'Malay': ['kod', 'pengesahan', 'kata laluan', 'mengesahkan', 'mengesahkan', 'kod anda ialah'],
-        'Filipino': ['code', 'beripikasyon', 'password', 'kumpirmahin', 'beripikahin', 'ang iyong code ay'],
-        'Swedish': ['kod', 'verifiering', 'lösenord', 'bekräfta', 'verifiera', 'din kod är'],
-        'Norwegian': ['kode', 'verifisering', 'passord', 'bekreft', 'verifiser', 'din kode er'],
-        'Danish': ['kode', 'verificering', 'adgangskode', 'bekræft', 'verificer', 'din kode er'],
-        'Finnish': ['koodi', 'vahvistus', 'salasana', 'vahvista', 'vahvistaa', 'koodisi on'],
-        'Greek': ['κωδικός', 'επιβεβαίωση', 'κωδικός πρόσβασης', 'επιβεβαιώστε', 'επιβεβαιώστε', 'ο κωδικός σας είναι'],
-        'Hebrew': ['קוד', 'אימות', 'סיסמה', 'אשר', 'אמת', 'הקוד שלך הוא'],
-        'Romanian': ['cod', 'verificare', 'parolă', 'confirmă', 'verifică', 'codul tău este'],
-        'Czech': ['kód', 'ověření', 'heslo', 'potvrdit', 'ověřit', 'váš kód je'],
-        'Hungarian': ['kód', 'igazolás', 'jelszó', 'megerősít', 'igazol', 'a kódod'],
-        'Bulgarian': ['код', 'потвърждение', 'парола', 'потвърди', 'провери', 'вашият код е'],
-        'Croatian': ['kod', 'verifikacija', 'lozinka', 'potvrdi', 'verificiraj', 'vaš kod je'],
-        'Serbian': ['код', 'верификација', 'лозинка', 'потврди', 'верификуј', 'ваш код је'],
-        'Slovak': ['kód', 'overenie', 'heslo', 'potvrď', 'over', 'váš kód je'],
-        'Slovenian': ['koda', 'verifikacija', 'geslo', 'potrdi', 'verificiraj', 'vaša koda je'],
-        'Ukrainian': ['код', 'підтвердження', 'пароль', 'підтвердити', 'перевірити', 'ваш код'],
-        'Belarusian': ['код', 'пацвярджэнне', 'пароль', 'пацвердзіць', 'праверыць', 'ваш код'],
-        'Kazakh': ['код', 'растау', 'құпия сөз', 'растау', 'тексеру', 'сіздің кодыңыз'],
-        'Uzbek': ['kod', 'tasdiqlash', 'parol', 'tasdiqlash', 'tekshirish', 'sizning kodingiz'],
-        'Azerbaijani': ['kod', 'təsdiq', 'şifrə', 'təsdiqlə', 'yoxla', 'sizin kodunuz'],
-        'Georgian': ['კოდი', 'დადასტურება', 'პაროლი', 'დადასტურება', 'შემოწმება', 'თქვენი კოდია'],
-        'Armenian': ['կոդ', 'հաստատում', 'գաղտնաբառ', 'հաստատել', 'ստուգել', 'ձեր կոդն է'],
-        'Mongolian': ['код', 'баталгаажуулалт', 'нууц үг', 'баталгаажуулах', 'шалгах', 'таны код'],
-        'Nepali': ['कोड', 'प्रमाणीकरण', 'पासवर्ड', 'पुष्टि', 'प्रमाणित', 'तपाईंको कोड'],
-        'Sinhala': ['කේතය', 'සත්‍යාපනය', 'මුරපදය', 'තහවුරු', 'සත්‍යාපනය', 'ඔබේ කේතය'],
-        'Tamil': ['குறியீடு', 'சரிபார்ப்பு', 'கடவுச்சொல்', 'உறுதிப்படுத்த', 'சரிபார்க்க', 'உங்கள் குறியீடு'],
-        'Telugu': ['కోడ్', 'ధృవీకరణ', 'పాస్వర్డ్', 'నిర్ధారించండి', 'ధృవీకరించండి', 'మీ కోడ్'],
-        'Marathi': ['कोड', 'सत्यापन', 'पासवर्ड', 'पुष्टी', 'सत्यापित', 'तुमचा कोड'],
-        'Gujarati': ['કોડ', 'ચકાસણી', 'પાસવર્ડ', 'પુષ્ટિ', 'ચકાસો', 'તમારો કોડ'],
-        'Kannada': ['ಕೋಡ್', 'ಪರಿಶೀಲನೆ', 'ಪಾಸ್ವರ್ಡ್', 'ದೃಢೀಕರಿಸಿ', 'ಪರಿಶೀಲಿಸಿ', 'ನಿಮ್ಮ ಕೋಡ್'],
-        'Malayalam': ['കോഡ്', 'സ്ഥിരീകരണം', 'പാസ്‌വേഡ്', 'സ്ഥിരീകരിക്കുക', 'പരിശോധിക്കുക', 'നിങ്ങളുടെ കോഡ്'],
-        'Punjabi': ['ਕੋਡ', 'ਪੜਤਾਲ', 'ਪਾਸਵਰਡ', 'ਪੁਸ਼ਟੀ', 'ਪੜਤਾਲ', 'ਤੁਹਾਡਾ ਕੋਡ'],
-        'Urdu': ['کوڈ', 'تصدیق', 'پاس ورڈ', 'تصدیق', 'تصدیق', 'آپ کا کوڈ'],
-        'Pashto': ['کوډ', 'تصدیق', 'پاسورډ', 'تصدیق', 'تصدیق', 'ستاسو کوډ'],
-        'Persian': ['کد', 'تأیید', 'رمز عبور', 'تأیید', 'تأیید', 'کد شما'],
-        'Kurdish': ['کۆد', 'دڵنیاکردنەوە', 'تێپەڕەوشە', 'دڵنیاکردنەوە', 'دڵنیاکردنەوە', 'کۆدی تۆ'],
-        'Amharic': ['ኮድ', 'ማረጋገጥ', 'የይለፍ ቃል', 'አረጋግጥ', 'ማረጋገጥ', 'ኮድዎ'],
-        'Swahili': ['kodi', 'uthibitishaji', 'neno la siri', 'thibitisha', 'thibitisha', 'kodi yako ni'],
-        'Afrikaans': ['kode', 'verifikasie', 'wagwoord', 'bevestig', 'verifieer', 'jou kode is'],
-        'Zulu': ['ikhodi', 'ukuqinisekisa', 'iphasiwedi', 'qinisekisa', 'qinisekisa', 'ikhodi yakho iyinto'],
-        'Xhosa': ['ikhowudi', 'ukuqinisekisa', 'iphasiwedi', 'qinisekisa', 'qinisekisa', 'ikhowudi yakho'],
-        'Igbo': ['koodu', 'nkwenye', 'paswọọdụ', 'kwado', 'kwado', 'koodu gị bụ'],
-        'Yoruba': ['koodu', 'ijẹrisi', 'ọrọ aṣina', 'jẹrisi', 'jẹrisi', 'koodu rẹ jẹ'],
-        'Hausa': ['lambar', 'tabbatarwa', 'kalmar sirri', 'tabbatar', 'tabbatar', 'lambar ku'],
-        'Somali': ['koodhka', 'xaqiijinta', 'ereyga sirta ah', 'xaqiiji', 'xaqiiji', 'koodhkaagu waa'],
-        'Oromo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Tigrinya': ['ኮድ', 'ምርመራ', 'ዓንቀጽ', 'ምርመራ', 'ምርመራ', 'ኮድካ'],
-        'Kinyarwanda': ['kode', 'kwemeza', 'ijambo ryibanga', 'kwemeza', 'kwemeza', 'kode yawe ni'],
-        'Luganda': ['koodi', 'okukakasa', 'ekiwandiiko', 'kakasa', 'kakasa', 'koodi yo'],
-        'Kiswahili': ['nambari', 'uthibitishaji', 'neno la siri', 'thibitisha', 'thibitisha', 'nambari yako ni'],
-        'Malagasy': ['kaody', 'fanamarinana', 'tenimiafina', 'hamarinina', 'hamarinina', 'kaody anao'],
-        'Sesotho': ['khoutu', 'tiisetsa', 'lefoko la sephiri', 'tiisetsa', 'tiisetsa', 'khoutu ea hau'],
-        'Setswana': ['khoutu', 'tiisetsa', 'lefoko la sephiri', 'tiisetsa', 'tiisetsa', 'khoutu ya gago'],
-        'Xitsonga': ['khodi', 'ntirhisano', 'vito ra xiviri', 'tirhisa', 'tirhisa', 'khodi ya wena'],
-        'Tshivenda': ['khodi', 'u ṱoḓisisa', 'ḽiṅwalwa ḽa tshifhinga', 'ṱoḓisisa', 'ṱoḓisisa', 'khodi yawe'],
-        'isiNdebele': ['ikhodi', 'ukuqinisekisa', 'igama elingaphandle', 'qinisekisa', 'qinisekisa', 'ikhodi yakho'],
-        'siSwati': ['ikhodi', 'ukuqinisekisa', 'ligama lephasiwedi', 'qinisekisa', 'qinisekisa', 'ikhodi yakho'],
-        'Kirundi': ['kode', 'kwemeza', 'ijambo ryibanga', 'kwemeza', 'kwemeza', 'kode yawe ni'],
-        'Chichewa': ['khodi', 'kutsimikiza', 'mawu achinsinsi', 'tsimikiza', 'tsimikiza', 'khodi yanu'],
-        'Kikuyu': ['koodi', 'gũthibitithia', 'rĩtwa rĩa thĩinĩ', 'thibitithia', 'thibitithia', 'koodi yaku'],
-        'Luo': ['kod', 'kelo', 'wach kelo', 'kelo', 'kelo', 'kod ma'],
-        'Wolof': ['kood', 'seere', 'baat bu nekk ci', 'seere', 'seere', 'kood bi'],
-        'Fula': ['koode', 'seedugol', 'baatol seedugol', 'seedugol', 'seedugol', 'koode maa'],
-        'Mandinka': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Bambara': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Soninke': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Songhay': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Hausa': ['lambar', 'tabbatarwa', 'kalmar sirri', 'tabbatar', 'tabbatar', 'lambar ku'],
-        'Yoruba': ['koodu', 'ijẹrisi', 'ọrọ aṣina', 'jẹrisi', 'jẹrisi', 'koodu rẹ jẹ'],
-        'Igbo': ['koodu', 'nkwenye', 'paswọọdụ', 'kwado', 'kwado', 'koodu gị bụ'],
-        'Ewe': ['koodu', 'nudzudzɔ', 'ŋuti', 'nudzudzɔ', 'nudzudzɔ', 'koodu wò'],
-        'Twi': ['koodu', 'sɛɛ', 'asɛm', 'sɛɛ', 'sɛɛ', 'koodu wo'],
-        'Ga': ['koodu', 'sɛɛ', 'asɛm', 'sɛɛ', 'sɛɛ', 'koodu wo'],
-        'Fante': ['koodu', 'sɛɛ', 'asɛm', 'sɛɛ', 'sɛɛ', 'koodu wo'],
-        'Akan': ['koodu', 'sɛɛ', 'asɛm', 'sɛɛ', 'sɛɛ', 'koodu wo'],
-        'Bambara': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Wolof': ['kood', 'seere', 'baat bu nekk ci', 'seere', 'seere', 'kood bi'],
-        'Fula': ['koode', 'seedugol', 'baatol seedugol', 'seedugol', 'seedugol', 'koode maa'],
-        'Mandinka': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Soninke': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Songhay': ['koodo', 'seedeyaa', 'baatool seedeyaa', 'seedeyaa', 'seedeyaa', 'koodo maa'],
-        'Berber': ['akud', 'asentem', 'awal n usentem', 'sentem', 'sentem', 'akud nnek'],
-        'Tamazight': ['akud', 'asentem', 'awal n usentem', 'sentem', 'sentem', 'akud nnek'],
-        'Afar': ['kood', 'xaqiijinta', 'ereyga sirta ah', 'xaqiiji', 'xaqiiji', 'koodkaagu'],
-        'Oromo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Tigrinya': ['ኮድ', 'ምርመራ', 'ዓንቀጽ', 'ምርመራ', 'ምርመራ', 'ኮድካ'],
-        'Amharic': ['ኮድ', 'ማረጋገጥ', 'የይለፍ ቃል', 'አረጋግጥ', 'ማረጋገጥ', 'ኮድዎ'],
-        'Gurage': ['ኮድ', 'ማረጋገጥ', 'የይለፍ ቃል', 'አረጋግጥ', 'ማረጋገጥ', 'ኮድዎ'],
-        'Harari': ['ኮድ', 'ማረጋገጥ', 'የይለፍ ቃል', 'አረጋግጥ', 'ማረጋገጥ', 'ኮድዎ'],
-        'Sidamo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Gedeo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Hadiyya': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Kambaata': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Gamo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Gofa': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Wolaytta': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Bench': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Sheko': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Majang': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Suri': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Mursi': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Bodi': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Kwegu': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Karo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Hamer': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Banna': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Bashada': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Aari': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Dime': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Nyangatom': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Toposa': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Turkana': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Pokot': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Samburu': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Rendille': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'El Molo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Boni': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Aweer': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Dahalo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Yaaku': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Elgon': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Okiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Ogiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Akiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Ndorobo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Dorobo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Sanye': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Boni': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Aweer': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Dahalo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Yaaku': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Elgon': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Okiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Ogiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Akiek': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Ndorobo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Dorobo': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee'],
-        'Sanye': ['koodii', 'mirkaneessi', 'jecha icciitii', 'mirkaneessi', 'mirkaneessi', 'koodiin kee']
+
+    text = str(sms_content).strip()
+    if not text:
+        return 'Unknown'
+
+    script_language = _detect_language_by_script(text)
+    if script_language:
+        return script_language
+
+    normalized = _strip_accents(text).lower()
+    normalized = re.sub(r'[^a-z0-9\s]', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    if not normalized:
+        return 'English'
+
+    padded = f" {normalized} "
+    template_overrides = [
+        (" ny kaody facebook nao ", "Malagasy"),
+        (" kaody facebook nao ", "Malagasy"),
+        (" ny kaody ", "Malagasy"),
+        (" adalah kode facebook anda ", "Indonesian"),
+        (" kode konfirmasi facebook anda ", "Indonesian"),
+        (" est votre code facebook ", "French"),
+        (" is your facebook code ", "English"),
+    ]
+    for phrase, language in template_overrides:
+        if phrase in padded:
+            return language
+
+    tokens = set(normalized.split())
+    language_patterns = {
+        'English': {
+            'phrases': [
+                ('your code is', 5), ('verification code', 5), ('one time password', 5),
+                ('do not share', 4), ('security code', 4), ('use this code', 3)
+            ],
+            'tokens': [('otp', 3), ('verify', 2), ('secure', 2), ('password', 1)],
+        },
+        'French': {
+            'phrases': [
+                ('votre code est', 6), ('code de verification', 5), ('ne partagez pas', 5),
+                ('mot de passe', 4)
+            ],
+            'tokens': [('verifier', 3), ('confirmer', 2), ('connexion', 2), ('votre', 1)],
+        },
+        'Spanish': {
+            'phrases': [
+                ('tu codigo es', 6), ('codigo de verificacion', 5), ('no compartas', 5),
+                ('codigo de seguridad', 4)
+            ],
+            'tokens': [('contrasena', 4), ('verificacion', 3), ('confirmar', 2), ('tu', 1)],
+        },
+        'Portuguese': {
+            'phrases': [
+                ('seu codigo e', 6), ('codigo de verificacao', 5), ('nao compartilhe', 5),
+                ('codigo de seguranca', 4)
+            ],
+            'tokens': [('senha', 4), ('verificacao', 3), ('confirmar', 2), ('seu', 1)],
+        },
+        'German': {
+            'phrases': [
+                ('ihr code ist', 6), ('dein code ist', 6), ('nicht teilen', 5),
+                ('bestatigungscode', 5)
+            ],
+            'tokens': [('passwort', 4), ('verifizieren', 3), ('bestaetigen', 3)],
+        },
+        'Italian': {
+            'phrases': [
+                ('il tuo codice e', 6), ('codice di verifica', 5), ('non condividere', 5)
+            ],
+            'tokens': [('conferma', 3), ('verifica', 3), ('password', 2)],
+        },
+        'Dutch': {
+            'phrases': [
+                ('uw code is', 6), ('deel deze code niet', 5), ('verificatiecode', 5)
+            ],
+            'tokens': [('wachtwoord', 4), ('bevestig', 3), ('verifieren', 3)],
+        },
+        'Turkish': {
+            'phrases': [
+                ('dogrulama kodu', 6), ('kimseyle paylasmayin', 5)
+            ],
+            'tokens': [('kodunuz', 5), ('sifre', 4), ('dogrulama', 3), ('onay', 2)],
+        },
+        'Indonesian': {
+            'phrases': [
+                ('kode verifikasi', 6), ('jangan bagikan', 5), ('kode anda adalah', 5),
+                ('adalah kode facebook anda', 7), ('kode konfirmasi facebook anda', 7)
+            ],
+            'tokens': [('verifikasi', 4), ('konfirmasi', 3), ('sandi', 3), ('anda', 2), ('adalah', 2)],
+        },
+        'Malay': {
+            'phrases': [
+                ('kod pengesahan', 6), ('jangan kongsi', 5), ('kod anda ialah', 5)
+            ],
+            'tokens': [('pengesahan', 4), ('sahkan', 3), ('laluan', 3), ('anda', 2)],
+        },
+        'Swahili': {
+            'phrases': [
+                ('msimbo wa kuthibitisha', 6), ('nambari yako ni', 5), ('usishiriki', 5)
+            ],
+            'tokens': [('uthibitishaji', 4), ('thibitisha', 3), ('neno', 2), ('siri', 2)],
+        },
+        'Malagasy': {
+            'phrases': [
+                ('kaody fanamarinana', 6), ('kaody anao', 5), ('aza zaraina', 5)
+            ],
+            'tokens': [('fanamarinana', 4), ('tenimiafina', 4), ('hamarinina', 3), ('kaody', 4), ('nao', 2)],
+        },
     }
-    
-    # Score-based detection (prevents generic "code" forcing English)
+
     scores = {}
-    for lang, keywords in language_keywords.items():
+    for lang, rules in language_patterns.items():
         score = 0
-        for keyword in keywords:
-            if keyword and keyword in sms_lower:
-                # Longer phrases are more informative
-                score += max(1, len(keyword) // 4)
-        if score > 0:
+        for phrase, weight in rules['phrases']:
+            phrase_hits = padded.count(f" {phrase} ")
+            if phrase_hits:
+                score += phrase_hits * weight
+        for token, weight in rules['tokens']:
+            if token in tokens:
+                score += weight
+        if score:
             scores[lang] = score
 
-    # Pick best scoring language (if any)
-    if scores:
-        best_lang = max(scores.items(), key=lambda kv: kv[1])[0]
-        return best_lang
+    if not scores:
+        return 'English'
 
-    # Default fallback
-    return 'English'
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_language, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+    # Require minimum confidence and clear lead over runner-up.
+    if best_score < 4:
+        return 'English'
+    if second_score and (best_score - second_score) < 2:
+        # Resolve common close-pairs using unique markers.
+        if {'laluan', 'pengesahan', 'kongsi'} & tokens:
+            return 'Malay'
+        if {'verifikasi', 'konfirmasi', 'bagikan', 'sandi'} & tokens:
+            return 'Indonesian'
+        if {'senha', 'nao', 'seu'} & tokens:
+            return 'Portuguese'
+        if {'contrasena', 'compartas', 'tu'} & tokens:
+            return 'Spanish'
+        if {'votre', 'partagez', 'mot'} & tokens:
+            return 'French'
+
+    return best_language
+
+
+def extract_masked_otp_from_sms(sms_content):
+    """Extract masked OTP token (e.g., ****** or ***-***)."""
+    if not sms_content:
+        return None
+
+    text = str(sms_content).replace("\n", " ")
+
+    patterns = [
+        r'(?:otp|code|verification|confirm)[^0-9*]*([0-9*]{3,8}(?:-[0-9*]{3,8})?)',
+        r'\b([0-9*]{3,8}-[0-9*]{3,8})\b',
+        r'\b([0-9*]{4,10})\b'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        token = match.group(1).strip()
+        # Console OTP values are masked with "*", keep masked format only.
+        if "*" in token:
+            return token
+
+    return None
+
+def is_console_otp_sms(sms_content, app_name=''):
+    """Best-effort OTP detection for console stream logs."""
+    text = f"{sms_content or ''} {app_name or ''}".lower()
+    keywords = [
+        "otp", "code", "verification", "verify", "facebook", "whatsapp",
+        "auth", "security", "confirm", "confirmation"
+    ]
+    if any(keyword in text for keyword in keywords):
+        return True
+
+    if sms_content and "*" in sms_content and re.search(r'[0-9*]{3,8}(?:-[0-9*]{3,8})?', sms_content):
+        return True
+
+    return False
+
+def remember_console_log(log_key):
+    """Track forwarded console log keys with bounded memory."""
+    if not log_key:
+        return
+
+    if log_key in forwarded_console_ids:
+        return
+
+    forwarded_console_ids.add(log_key)
+    forwarded_console_order.append(log_key)
+
+    if len(forwarded_console_order) > MAX_FORWARDED_CONSOLE_IDS:
+        old_key = forwarded_console_order.pop(0)
+        forwarded_console_ids.discard(old_key)
+
+def build_console_channel_message(log_item):
+    """Build channel message using legacy one-line channel template."""
+    country = str(log_item.get('country') or 'Unknown').strip() or 'Unknown'
+    service_raw = str(log_item.get('app_name') or 'Unknown').strip() or 'Unknown'
+    number_masked = str(log_item.get('number') or 'Unknown').strip() or 'Unknown'
+    sms_content = str(log_item.get('sms') or '').strip()
+    language = detect_language_from_sms(sms_content) if sms_content else 'English'
+    service_key = normalize_service_name(service_raw)
+
+    country_flag = get_country_flag(country)
+    country_code = get_country_code(country)
+    service_display = {
+        "whatsapp": "WhatsApp",
+        "facebook": "Facebook",
+        "telegram": "Telegram"
+    }.get(service_key, service_raw)
+
+    return f"{country_flag} #{country_code} {html.escape(service_display)} {html.escape(number_masked)} {html.escape(language)}"
 
 # Bot Handlers
 async def rangechkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1545,6 +1932,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     username = user.username or user.first_name or "Unknown"
+    deep_link_arg = context.args[0] if context.args else None
+    deep_link_range, deep_link_service = parse_range_start_payload(deep_link_arg)
     
     # Get current status first (before adding user)
     status = get_user_status(user_id)
@@ -1576,6 +1965,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
+
+        # If user opened bot from channel "Range" button, fetch numbers immediately.
+        if deep_link_range:
+            await update.message.reply_text(f"⏳ Processing range: {deep_link_range}")
+            await send_numbers_from_range_link(update, context, deep_link_range, deep_link_service)
     elif status == 'rejected':
         await update.message.reply_text("❌ Your access has been rejected. Please contact admin.")
     else:
@@ -1856,7 +2250,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 # Use get_ranges("others") which searches many keywords
                 # No lock needed as APIClient handles internal state
-                ranges = api_client.get_ranges("others")
+                ranges = await run_api_call(api_client.get_ranges, "others")
                 
                 if not ranges:
                     await query.edit_message_text("❌ No services found.")
@@ -1941,8 +2335,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Invalid service.")
             return
         
-        with api_lock:
-            ranges = api_client.get_ranges(app_id)
+        ranges = await run_api_call(api_client.get_ranges, app_id)
         
         if not ranges:
             await query.edit_message_text(f"❌ No active ranges available for {service_name}.")
@@ -2001,20 +2394,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Helper for UI Truncation
         def format_country_label(flag, name, time_str, max_len=30):
-            if not time_str:
-                return f"{flag} {name}"
-            
-            time_part = f" ({time_str})"
-            # Calculate remaining space for name
-            # flag (2) + space (1) + name + time_part
-            # name <= max_len - len(time_part) - 3
-            available_len = max_len - len(time_part) - 3
-            if available_len < 5: available_len = 5 # Safety floor
-            
+            # Keep country sort behavior by time, but do not show time text.
+            available_len = max_len - 3
+            if available_len < 5:
+                available_len = 5
+
             if len(name) > available_len:
-                name = name[:available_len-1] + "…"
-            
-            return f"{flag} {name}{time_part}"
+                name = name[:available_len - 3] + "..."
+
+            return f"{flag} {name}"
 
         for i in range(0, len(sorted_countries), 2):
             row = []
@@ -2067,7 +2455,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
                 
             # Get ranges "others" (cached)
-            ranges = api_client.get_ranges("others")
+            ranges = await run_api_call(api_client.get_ranges, "others")
             
             if not ranges:
                 await query.edit_message_text("❌ No ranges found (session expired?).")
@@ -2185,8 +2573,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ API connection error. Please try again.")
             return
         
-        with api_lock:
-            ranges = api_client.get_ranges(app_id)
+        ranges = await run_api_call(api_client.get_ranges, app_id)
         
         # Find ranges for this country - collect all matching ranges first
         # Match by detecting country from range name, not just API country field
@@ -2256,7 +2643,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # with api_lock:
                 # Try range_name first, then range_id (like otp_tool.py)
-                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+                numbers_data = await run_api_call(api_client.get_multiple_numbers, range_id, range_name, number_count)
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -2390,7 +2777,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Get ranges "others" (cached fast)
-            ranges = api_client.get_ranges("others")
+            ranges = await run_api_call(api_client.get_ranges, "others")
             
             if not ranges:
                 await query.edit_message_text(f"❌ No ranges found for {service_name}.")
@@ -2533,7 +2920,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 app_id = service_name
             
             # Fetch ranges
-            ranges = api_client.get_ranges(app_id)
+            ranges = await run_api_call(api_client.get_ranges, app_id)
             
             # Filter by country
             filtered_ranges = []
@@ -2640,7 +3027,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("⏳ Discovering services (this may take a moment)...")
                 try:
                     # Get ranges "others"
-                    ranges = api_client.get_ranges("others")
+                    ranges = await run_api_call(api_client.get_ranges, "others")
                     
                     if not ranges:
                         await query.edit_message_text("❌ No services found.")
@@ -2721,8 +3108,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("❌ Invalid service.")
                     return
 
-                with api_lock:
-                    ranges = api_client.get_ranges(app_id)
+                ranges = await run_api_call(api_client.get_ranges, app_id)
 
                 if not ranges or len(ranges) == 0:
                     await query.edit_message_text(f"❌ No ranges found for {service_name.upper()}.")
@@ -2837,8 +3223,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # with api_lock:
                 logger.info(f"Calling get_multiple_numbers with range_name={range_name}, range_id={range_id}, count={number_count}")
                 # Try range_name first, then range_id (like otp_tool.py)
-                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
-                logger.info(f"get_multiple_numbers returned: {numbers_data}")
+                numbers_data = await run_api_call(api_client.get_multiple_numbers, range_id, range_name, number_count)
+                logger.info(f"get_multiple_numbers returned {len(numbers_data) if numbers_data else 0} item(s)")
                 
                 if not numbers_data or len(numbers_data) == 0:
                     await context.bot.edit_message_text(
@@ -2948,7 +3334,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'numbers': numbers_list,
                     'service': service_name,
                     'range_id': range_id,
-                    'start_time': time.time()
+                    'start_time': time.time(),
+                    'message_id': query.message.message_id
                 }
                 if country_name:
                     job_data['country'] = country_name
@@ -3086,8 +3473,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         try:
-            with api_lock:
-                ranges = api_client.get_ranges(app_id)
+            ranges = await run_api_call(api_client.get_ranges, app_id)
             
             if not ranges:
                 await update.message.reply_text(f"❌ No active ranges available for {service_name}.")
@@ -3156,7 +3542,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle direct range input (e.g., "24491501XXX" or "24491501")
     elif re.match(r'^[\dXx]+$', text) and len(text) >= 6:
-        # Looks like a range pattern - search across all services
+        # Direct range buy: always use WhatsApp without active-range lookup.
         range_pattern = text.upper()
         
         # Get global API client
@@ -3164,72 +3550,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not api_client:
             await update.message.reply_text("❌ API connection error. Please try again.")
             return
-        
-        service_map = {
-            "whatsapp": "verifyed-access-whatsapp",
-            "facebook": "verifyed-access-facebook",
-            "telegram": "verifyed-access-telegram"
-        }
-        
-        # Search for range across all services
-        found_range = None
-        found_service = None
-        
-        await update.message.reply_text("⏳ Searching for range...")
+
+        found_service = "whatsapp"
+        range_name = range_pattern
+        range_id = range_pattern
+        await update.message.reply_text("⏳ Buying directly via WhatsApp...")
         
         try:
-            for service_name, app_id in service_map.items():
-                with api_lock:
-                    ranges = api_client.get_ranges(app_id)
-                
-                # Search for matching range
-                for r in ranges:
-                    range_name = r.get('name', r.get('id', ''))
-                    range_id = r.get('id', r.get('name', ''))
-                    
-                    # Check if range matches pattern (remove X's and compare)
-                    range_clean = str(range_name).replace('X', '').replace('x', '').replace('+', '').replace('-', '').replace(' ', '')
-                    pattern_clean = range_pattern.replace('X', '').replace('x', '')
-                    
-                    # Try exact match or partial match
-                    if pattern_clean in range_clean or range_clean.startswith(pattern_clean) or pattern_clean.startswith(range_clean[:len(pattern_clean)]):
-                        found_range = r
-                        found_service = service_name
-                        break
-                
-                if found_range:
-                    break
-            
-            if not found_range:
-                # Fallback: Try directly with the input string as both name and ID
-                # Default to WhatsApp as it's the most common use case
-                found_service = "whatsapp"
-                range_name = text
-                range_id = text
-                # Try to detect service from previous context if possible, otherwise WhatsApp
-                message = f"⚠️ Range '{text}' not found in active list.\nTrying direct request via WhatsApp..."
-                await update.message.reply_text(message)
-                
-                # Create a pseudo found_range object
-                found_range = {
-                    'name': text,
-                    'id': text,
-                    'country': 'Unknown',
-                    'cantryName': 'Unknown',
-                    'operator': 'Unknown'
-                }
-            
-            # Found range - get numbers (like otp_tool.py)
-            range_name = found_range.get('name', '')
-            range_id = found_range.get('id', found_range.get('name', ''))
-            
             # Get user's number count preference
             session = get_user_session(user_id)
             number_count = session.get('number_count', 2) if session else 2
             
-            with api_lock:
-                # Try range_name first, then range_id (like otp_tool.py)
-                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+            # Try range_name first, then range_id (like otp_tool.py)
+            numbers_data = await run_api_call(api_client.get_multiple_numbers, range_id, range_name, number_count)
+
+            # If user typed digits-only range, retry once with XXX suffix.
+            if (not numbers_data or len(numbers_data) == 0) and 'X' not in range_pattern:
+                range_name = f"{range_pattern}XXX"
+                range_id = range_name
+                numbers_data = await run_api_call(api_client.get_multiple_numbers, range_id, range_name, number_count)
             
             if not numbers_data or len(numbers_data) == 0:
                 await update.message.reply_text("❌ Failed to get numbers from this range. Please try again.")
@@ -3372,8 +3711,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         try:
-            with api_lock:
-                ranges = api_client.get_ranges(app_id)
+            ranges = await run_api_call(api_client.get_ranges, app_id)
             
             # Find ranges for this country - collect all matching ranges first
             # Match by detecting country from range name, not just API country field
@@ -3425,9 +3763,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Request numbers
             await update.message.reply_text(f"⏳ Requesting {number_count} number(s)...")
             
-            with api_lock:
-                # Try range_name first, then range_id (like otp_tool.py)
-                numbers_data = api_client.get_multiple_numbers(range_id, range_name, number_count)
+            # Try range_name first, then range_id (like otp_tool.py)
+            numbers_data = await run_api_call(api_client.get_multiple_numbers, range_id, range_name, number_count)
             
             if not numbers_data or len(numbers_data) == 0:
                 await update.message.reply_text("❌ Failed to get numbers. Please try again.")
@@ -3537,18 +3874,54 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
             del user_jobs[user_id]
         update_user_session(user_id, monitoring=0)
         try:
+            # Keep the same numbers visible and mark unresolved numbers as expired.
+            service_name = str(job_data.get('service') or 'Unknown')
+            country_name = str(job_data.get('country') or 'Unknown')
+            range_id = str(job_data.get('range_id') or '').strip()
+
+            service_icons = {
+                "whatsapp": "💬",
+                "facebook": "👥",
+                "telegram": "✈️"
+            }
+            service_icon = service_icons.get(service_name, "📱")
+            country_flag = get_country_flag(country_name) if country_name and country_name != 'Unknown' else "🌍"
+
+            keyboard = []
+            status_lines = []
+            for num in numbers:
+                status_label = "OTP" if num in received_otps else "Expired"
+                button_label = f"📱 {num} ({status_label})"
+                keyboard.append([InlineKeyboardButton(
+                    button_label,
+                    api_kwargs={"copy_text": {"text": num}}
+                )])
+                status_lines.append(f"{num} - {status_label}")
+
+            timeout_text = f"{service_icon} {service_name.upper()}\n"
+            if country_name and country_name != 'Unknown':
+                timeout_text += f"{country_flag} {country_name}\n"
+            if range_id:
+                timeout_text += f"📋 Range: {range_id}\n"
+            timeout_text += "\n⏱️ Timeout! No OTP received within 15 minutes.\n\n"
+            timeout_text += "Number status:\n" + "\n".join(status_lines)
+
+            timeout_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
             # Edit the existing message instead of sending a new one
             if message_id:
                 await context.bot.edit_message_text(
                     chat_id=user_id,
                     message_id=message_id,
-                    text=f"⏱️ Timeout! No OTP received within 15 minutes."
+                    text=timeout_text,
+                    reply_markup=timeout_markup
                 )
             else:
                 # Fallback to sending new message if message_id not available
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"⏱️ Timeout! No OTP received within 15 minutes."
+                    text=timeout_text,
+                    reply_markup=timeout_markup
                 )
         except Exception as e:
             logger.error(f"Error updating timeout message: {e}")
@@ -3565,7 +3938,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         try:
             # We don't use api_lock here anymore to allow high concurrency
             # The APIClient.login method is now internally thread-safe
-            otp_results = api_client.check_otp_batch(numbers)
+            otp_results = await run_api_call(api_client.check_otp_batch, numbers)
         except Exception as api_error:
             logger.error(f"API error in check_otp_batch: {api_error}")
             return  # Skip this check, will retry next interval
@@ -3705,9 +4078,28 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         masked_number = masked_number[1:]  # Remove + for display
                     channel_otp_msg = f"{country_flag} #{country_code} {service.capitalize()} {masked_number} {language}"
                     
-                    # Create inline keyboard with OTP copy button
-                    keyboard = [[InlineKeyboardButton(f"🔐 {otp}", api_kwargs={"copy_text": {"text": otp}})]] 
-                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    # Build deep-link URL for the "Range" button (channel only)
+                    range_for_button = None
+                    if job_data:
+                        range_for_button = job_data.get('range_id')
+                    if not range_for_button and session:
+                        range_for_button = session.get('range_id')
+                    if not range_for_button:
+                        range_for_button = infer_range_from_number(number)
+                    if range_for_button and job_data and not job_data.get('range_id'):
+                        job_data['range_id'] = range_for_button
+
+                    range_url = await build_range_deeplink(context, range_for_button, service)
+
+                    # User keyboard keeps only OTP copy.
+                    user_keyboard = [[InlineKeyboardButton(f"🔐 {otp}", api_kwargs={"copy_text": {"text": otp}})]]
+                    user_reply_markup = InlineKeyboardMarkup(user_keyboard)
+
+                    # Channel keyboard: OTP copy + Range button side by side.
+                    channel_row = [InlineKeyboardButton(f"🔐 {otp}", api_kwargs={"copy_text": {"text": otp}})]
+                    if range_url:
+                        channel_row.append(InlineKeyboardButton("Range", url=range_url))
+                    channel_reply_markup = InlineKeyboardMarkup([channel_row])
                     
                     # Send OTP message to user FIRST (important!)
                     user_message_sent = False
@@ -3716,7 +4108,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         sent_msg = await context.bot.send_message(
                             chat_id=user_id,
                             text=user_otp_msg,
-                            reply_markup=reply_markup,
+                            reply_markup=user_reply_markup,
                             parse_mode='HTML'
                         )
                         user_message_sent = True
@@ -3731,7 +4123,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(
                             chat_id=OTP_CHANNEL_ID,
                             text=channel_otp_msg,
-                            reply_markup=reply_markup,
+                            reply_markup=channel_reply_markup,
                             parse_mode='HTML'
                         )
                         logger.info(f"✅ OTP forwarded to channel {OTP_CHANNEL_ID} for {number}: {otp}")
@@ -3758,6 +4150,117 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                     # Otherwise, continue monitoring for remaining numbers
     except Exception as e:
         logger.error(f"Error monitoring OTP for user {user_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+async def monitor_console_logs(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor masked console OTP stream and forward unique new entries to channel."""
+    global console_bootstrapped
+
+    api_client = get_global_api_client()
+    if not api_client:
+        return
+
+    try:
+        logs = await run_api_call(api_client.get_console_logs)
+        if not logs:
+            return
+
+        normalized_logs = []
+        for item in logs:
+            if not isinstance(item, dict):
+                continue
+
+            raw_id = item.get('id')
+            log_id = None
+            if raw_id is not None:
+                try:
+                    log_id = int(raw_id)
+                except (TypeError, ValueError):
+                    log_id = None
+
+            if log_id is not None:
+                log_key = f"id:{log_id}"
+            else:
+                fallback = f"{item.get('time','')}|{item.get('number','')}|{item.get('app_name','')}|{item.get('sms','')}"
+                log_key = f"sig:{hashlib.md5(fallback.encode('utf-8')).hexdigest()}"
+
+            normalized_logs.append((log_id, log_key, item))
+
+        if not normalized_logs:
+            return
+
+        with console_lock:
+            if not console_bootstrapped:
+                for _, key, _ in normalized_logs:
+                    remember_console_log(key)
+                console_bootstrapped = True
+                logger.info(f"Console monitor bootstrapped with {len(normalized_logs)} existing logs")
+                return
+
+        normalized_logs.sort(
+            key=lambda row: (row[0] is None, row[0] if row[0] is not None else 0),
+            reverse=True
+        )
+
+        cycle_deadline = time.time() + max(0.5, CONSOLE_CYCLE_BUDGET_SECONDS)
+        sent_this_cycle = 0
+
+        for _, log_key, log_item in normalized_logs:
+            if time.time() > cycle_deadline:
+                logger.debug("Console monitor cycle budget reached; continuing next run")
+                break
+
+            with console_lock:
+                if log_key in forwarded_console_ids:
+                    continue
+
+            sms_content = str(log_item.get('sms') or '')
+            service = str(log_item.get('app_name') or '')
+            service_key = normalize_service_name(service)
+
+            # Forward only allowed service groups (fixed for now).
+            if CONSOLE_FORWARD_SERVICE_KEYS and service_key not in CONSOLE_FORWARD_SERVICE_KEYS:
+                with console_lock:
+                    remember_console_log(log_key)
+                continue
+
+            if not is_console_otp_sms(sms_content, service):
+                with console_lock:
+                    remember_console_log(log_key)
+                continue
+
+            channel_message = build_console_channel_message(log_item)
+            masked_otp = extract_masked_otp_from_sms(sms_content) or "******"
+            range_value = str(log_item.get('range') or '').strip()
+            range_url = await build_range_deeplink(context, range_value, service_key)
+
+            channel_row = [InlineKeyboardButton(f"🔐 {masked_otp}", api_kwargs={"copy_text": {"text": masked_otp}})]
+            if range_url:
+                channel_row.append(InlineKeyboardButton("Range", url=range_url))
+            channel_reply_markup = InlineKeyboardMarkup([channel_row])
+
+            try:
+                await context.bot.send_message(
+                    chat_id=OTP_CHANNEL_ID,
+                    text=channel_message,
+                    reply_markup=channel_reply_markup,
+                    parse_mode='HTML'
+                )
+                logger.info(f"Console OTP forwarded to channel: {log_key}")
+            except Exception as send_error:
+                logger.error(f"Error forwarding console OTP {log_key}: {type(send_error).__name__}: {send_error}")
+                continue
+
+            with console_lock:
+                remember_console_log(log_key)
+
+            sent_this_cycle += 1
+            if sent_this_cycle >= max(1, CONSOLE_MAX_FORWARDS_PER_CYCLE):
+                logger.debug("Console monitor send cap reached; continuing next run")
+                break
+    except Exception as e:
+        logger.error(f"Error in monitor_console_logs: {e}")
         import traceback
         logger.error(traceback.format_exc())
 
@@ -3810,6 +4313,8 @@ def main():
             logger.error(f"❌ Error: {error}", exc_info=error)
     
     application.add_error_handler(error_handler)
+
+    # Console-to-channel forwarding disabled by requirement.
     
     # Start bot with drop_pending_updates to avoid conflicts
     logger.info("Bot starting...")
@@ -3834,4 +4339,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
