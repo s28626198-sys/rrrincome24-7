@@ -23,23 +23,6 @@ from flask import Flask
 # Load environment variables
 load_dotenv()
 
-
-def require_env(name: str) -> str:
-    """Read required env var and fail fast with clear message."""
-    value = os.getenv(name)
-    if value is None or str(value).strip() == "":
-        raise ValueError(f"{name} environment variable is required.")
-    return value.strip()
-
-
-def require_int_env(name: str) -> int:
-    """Read required integer env var and validate format."""
-    raw = require_env(name)
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a valid integer, got: {raw!r}") from exc
-
 # Try to import cloudscraper for Cloudflare bypass
 try:
     import cloudscraper
@@ -68,19 +51,23 @@ try:
 except ImportError:
     HAS_CLOUDSCRAPER = False
 
-# Bot Configuration (required env vars)
-BOT_TOKEN = require_env("BOT_TOKEN")
-ADMIN_USER_ID = require_int_env("ADMIN_USER_ID")
-OTP_CHANNEL_ID = require_int_env("OTP_CHANNEL_ID")  # Channel ID for forwarding OTP messages
+# Bot Configuration (from environment variables only - no default value)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required. Please set it in Render environment variables.")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "5742928021"))
+OTP_CHANNEL_ID = int(os.getenv("OTP_CHANNEL_ID", "-1003403204287"))  # Channel ID for forwarding OTP messages
+AUTO_APPROVE_USERS = True
+CONSOLE_CHANNEL_FORWARD_ENABLED = False
 
 # API Configuration (from otp_tool.py)
 BASE_URL = "https://stexsms.com"
-API_EMAIL = require_env("API_EMAIL")
-API_PASSWORD = require_env("API_PASSWORD")
+API_EMAIL = os.getenv("API_EMAIL", "roni791158@gmail.com")
+API_PASSWORD = os.getenv("API_PASSWORD", "53561106@Roni")
 
-# Supabase Configuration (required env vars)
-SUPABASE_URL = require_env("SUPABASE_URL")
-SUPABASE_KEY = require_env("SUPABASE_KEY")
+# Supabase Configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://sgnnqvfoajqsfdyulolm.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNnbm5xdmZvYWpxc2ZkeXVsb2xtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQxNzE1MjcsImV4cCI6MjA3OTc0NzUyN30.dFniV0odaT-7bjs5iQVFQ-N23oqTGMAgQKjswhaHSP4")
 
 # Supabase Database setup
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -220,24 +207,33 @@ def get_user_status(user_id):
             if result.data and len(result.data) > 0:
                 status = result.data[0].get('status')
                 if status:
+                    if AUTO_APPROVE_USERS and status == 'pending':
+                        return 'approved'
                     return status
-        # Return 'pending' if user doesn't exist (not None)
+        # Auto-approve when user is missing from database.
+        if AUTO_APPROVE_USERS:
+            return 'approved'
         return 'pending'
     except Exception as e:
         logger.error(f"Error getting user status: {e}")
-        # Return 'pending' on error to avoid approval loop
+        if AUTO_APPROVE_USERS:
+            return 'approved'
         return 'pending'
 
 def add_user(user_id, username):
     """Add new user to database"""
     try:
+        status = 'approved' if AUTO_APPROVE_USERS else 'pending'
         with db_lock:
             # Use integer user_id (BIGINT in database)
-            supabase.table('users').upsert({
+            payload = {
                 'user_id': int(user_id),
                 'username': username,
-                'status': 'pending'
-            }).execute()
+                'status': status
+            }
+            if status == 'approved':
+                payload['approved_at'] = datetime.now().isoformat()
+            supabase.table('users').upsert(payload).execute()
     except Exception as e:
         logger.error(f"Error adding user: {e}")
 
@@ -1937,10 +1933,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Get current status first (before adding user)
     status = get_user_status(user_id)
-    
-    # Add user to database only if status is 'pending' (user doesn't exist or is pending)
-    # This prevents overwriting approved/rejected status
-    if status == 'pending':
+
+    # Auto-approve onboarding (keeps explicit rejects intact).
+    if AUTO_APPROVE_USERS and status != 'rejected':
+        add_user(user_id, username)
+        status = 'approved'
+    # Manual flow fallback
+    elif status == 'pending':
+        # Add user to database only if status is 'pending' (user doesn't exist or is pending)
+        # This prevents overwriting approved/rejected status
         add_user(user_id, username)
         # Re-check status after adding
         status = get_user_status(user_id)
@@ -4314,7 +4315,24 @@ def main():
     
     application.add_error_handler(error_handler)
 
-    # Console-to-channel forwarding disabled by requirement.
+    # Global console stream monitor (masked OTP logs from /mdashboard/console)
+    if CONSOLE_CHANNEL_FORWARD_ENABLED and application.job_queue:
+        application.job_queue.run_repeating(
+            monitor_console_logs,
+            interval=CONSOLE_MONITOR_INTERVAL,
+            first=5,
+            name="console_otp_monitor",
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 15
+            }
+        )
+        logger.info("Console OTP monitor job started")
+    elif not CONSOLE_CHANNEL_FORWARD_ENABLED:
+        logger.info("Console OTP channel forwarding is disabled")
+    else:
+        logger.warning("Job queue not available; console OTP monitor not started")
     
     # Start bot with drop_pending_updates to avoid conflicts
     logger.info("Bot starting...")
@@ -4339,6 +4357,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
