@@ -79,6 +79,34 @@ SERVICE_APP_IDS = {
     "telegram": "Telegram",
 }
 
+# UI labels (logic/callbacks remain unchanged)
+BTN_GET_NUMBER = "🚀 Get Number"
+BTN_SET_NUMBER_COUNT = "⚙️ Number Count"
+BTN_MY_STATS = "📈 My Stats"
+SERVICE_BTN_WHATSAPP = "💬 WhatsApp OTP"
+SERVICE_BTN_FACEBOOK = "👥 Facebook OTP"
+SERVICE_BTN_TELEGRAM = "✈️ Telegram OTP"
+SERVICE_BTN_OTHERS = "🧩 Explore Others"
+
+
+def build_main_menu_markup():
+    keyboard = [
+        [KeyboardButton(BTN_GET_NUMBER)],
+        [KeyboardButton(BTN_SET_NUMBER_COUNT)],
+        [KeyboardButton(BTN_MY_STATS)]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+
+
+def build_service_menu_markup(callback_prefix="service_"):
+    keyboard = [
+        [InlineKeyboardButton(SERVICE_BTN_WHATSAPP, callback_data=f"{callback_prefix}whatsapp")],
+        [InlineKeyboardButton(SERVICE_BTN_FACEBOOK, callback_data=f"{callback_prefix}facebook")],
+        [InlineKeyboardButton(SERVICE_BTN_TELEGRAM, callback_data=f"{callback_prefix}telegram")],
+        [InlineKeyboardButton(SERVICE_BTN_OTHERS, callback_data=f"{callback_prefix}others")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def init_database():
     """Initialize Supabase database (tables should be created manually via SQL)"""
     try:
@@ -137,11 +165,21 @@ api_io_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(16, API_IO_WORKERS),
     thread_name_prefix="api-io"
 )
+DB_IO_WORKERS = int(os.getenv("DB_IO_WORKERS", "32"))
+db_io_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(8, DB_IO_WORKERS),
+    thread_name_prefix="db-io"
+)
 
 async def run_api_call(func, *args, **kwargs):
     """Run blocking API call in thread pool to keep event loop responsive."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(api_io_executor, partial(func, *args, **kwargs))
+
+async def run_db_call(func, *args, **kwargs):
+    """Run blocking DB call in a dedicated thread pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(db_io_executor, partial(func, *args, **kwargs))
 
 def get_global_api_client():
     """Get or create global API client (single session for all users)"""
@@ -1336,6 +1374,37 @@ def infer_range_from_number(number):
         return f"{digits[:-3]}XXX"
     return digits or None
 
+def normalize_range_for_deeplink(raw_range, fallback_number=None):
+    """Normalize range token for deep-link usage and avoid short numeric IDs."""
+    token = _sanitize_start_token(raw_range, max_len=40).upper()
+    digit_len = len(re.sub(r'[^0-9]', '', token))
+    # Short pure-numeric values are often internal IDs, not real range patterns.
+    if token and ('X' in token or digit_len >= 6):
+        return token
+    if fallback_number:
+        inferred = _sanitize_start_token(infer_range_from_number(fallback_number), max_len=40).upper()
+        if inferred:
+            return inferred
+    return token or None
+
+def resolve_range_token(range_obj):
+    """Extract the best range pattern token from a range object."""
+    if not isinstance(range_obj, dict):
+        return None
+
+    candidates = [
+        range_obj.get('range_id'),
+        range_obj.get('pattern'),
+        range_obj.get('name'),
+        range_obj.get('id'),
+        range_obj.get('numerical_id'),
+    ]
+    for candidate in candidates:
+        normalized = normalize_range_for_deeplink(candidate)
+        if normalized:
+            return normalized
+    return None
+
 def normalize_service_name(service_name):
     """Normalize service text to internal key."""
     if not service_name:
@@ -1409,7 +1478,7 @@ async def send_numbers_from_range_link(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("❌ API connection error. Please try again.")
         return
 
-    session = get_user_session(user_id)
+    session = await run_db_call(get_user_session, user_id)
     number_count = session.get('number_count', 2) if session else 2
     base_range = _sanitize_start_token(range_value, max_len=40).upper()
 
@@ -1491,7 +1560,8 @@ async def send_numbers_from_range_link(update: Update, context: ContextTypes.DEF
         reply_markup=reply_markup
     )
 
-    update_user_session(
+    await run_db_call(
+        update_user_session,
         user_id,
         service=found_service,
         country=country_name,
@@ -1899,7 +1969,7 @@ async def rangechkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     # Check if user is approved
-    status = get_user_status(user_id)
+    status = await run_db_call(get_user_status, user_id)
     if status != 'approved':
         await update.message.reply_text("❌ Your access is pending approval.")
         return
@@ -1910,16 +1980,10 @@ async def rangechkr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ API connection error. Please try again.")
         return
     
-    # Show service selection first (fixed three: WhatsApp, Facebook, Others)
-    keyboard = [
-        [InlineKeyboardButton("💬 WhatsApp", callback_data="rangechkr_service_whatsapp")],
-        [InlineKeyboardButton("👥 Facebook", callback_data="rangechkr_service_facebook")],
-        [InlineKeyboardButton("✈️ Telegram", callback_data="rangechkr_service_telegram")],
-        [InlineKeyboardButton("✨ Others", callback_data="rangechkr_service_others")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # Show service selection first
+    reply_markup = build_service_menu_markup("rangechkr_service_")
     await update.message.reply_text(
-        "🗂️ Select service to view ranges:",
+        "🗂️ Range Center\nChoose a service to view active ranges:",
         reply_markup=reply_markup
     )
 
@@ -1932,36 +1996,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deep_link_range, deep_link_service = parse_range_start_payload(deep_link_arg)
     
     # Get current status first (before adding user)
-    status = get_user_status(user_id)
+    status = await run_db_call(get_user_status, user_id)
 
     # Auto-approve onboarding (keeps explicit rejects intact).
     if AUTO_APPROVE_USERS and status != 'rejected':
-        add_user(user_id, username)
+        await run_db_call(add_user, user_id, username)
         status = 'approved'
     # Manual flow fallback
     elif status == 'pending':
         # Add user to database only if status is 'pending' (user doesn't exist or is pending)
         # This prevents overwriting approved/rejected status
-        add_user(user_id, username)
+        await run_db_call(add_user, user_id, username)
         # Re-check status after adding
-        status = get_user_status(user_id)
+        status = await run_db_call(get_user_status, user_id)
     
     if status == 'approved':
         # Get current number count setting
-        session = get_user_session(user_id)
+        session = await run_db_call(get_user_session, user_id)
         current_count = session.get('number_count', 2) if session else 2
         
-        # Show main menu buttons
-        keyboard = [
-            [KeyboardButton("📲 Get Number")],
-            [KeyboardButton("🧮 Set Number Count")],
-            [KeyboardButton("📊 My Stats")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+        # Show refreshed main menu buttons
+        reply_markup = build_main_menu_markup()
         await update.message.reply_text(
-            "✨ Welcome!\n\n"
-            "📲 Tap **Get Number** to start getting numbers.\n"
-            "🧮 Use **Set Number Count** to choose how many numbers you receive.\n"
+            "✨ OTP Dashboard is ready\n\n"
+            f"{BTN_GET_NUMBER}: fetch fresh numbers\n"
+            f"{BTN_SET_NUMBER_COUNT}: set your batch size\n"
+            f"{BTN_MY_STATS}: view today's activity\n\n"
             f"📌 Current setting: **{current_count}** number(s)",
             reply_markup=reply_markup,
             parse_mode="Markdown"
@@ -2012,7 +2072,7 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = update.message.text.split()[0] if update.message.text else ""
     
     if command == "/users":
-        users = get_all_users()
+        users = await run_db_call(get_all_users)
         if not users:
             await update.message.reply_text("📋 No users found.")
             return
@@ -2035,8 +2095,8 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             # Ensure user exists (username unknown here) then approve
-            add_user(target_id, username=None)
-            approve_user(target_id)
+            await run_db_call(add_user, target_id, username=None)
+            await run_db_call(approve_user, target_id)
             await update.message.reply_text(f"✅ User {target_id} approved/added successfully.")
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {e}")
@@ -2049,7 +2109,7 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if target_id in user_jobs:
                     user_jobs[target_id].schedule_removal()
                     del user_jobs[target_id]
-                remove_user(target_id)
+                await run_db_call(remove_user, target_id)
                 await update.message.reply_text(f"✅ User {target_id} removed successfully.")
             else:
                 await update.message.reply_text("Usage: /remove <user_id>")
@@ -2057,7 +2117,7 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Error: {e}")
     
     elif command == "/pending":
-        pending = get_pending_users()
+        pending = await run_db_call(get_pending_users)
         if not pending:
             await update.message.reply_text("✅ No pending users.")
             return
@@ -2090,7 +2150,7 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        approved_user_ids = get_approved_user_ids()
+        approved_user_ids = await run_db_call(get_approved_user_ids)
         if not approved_user_ids:
             await update.message.reply_text("ℹ️ No approved users found to broadcast to.")
             return
@@ -2141,7 +2201,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if data.startswith("admin_approve_"):
             target_user_id = int(data.split("_")[2])
-            approve_user(target_user_id)
+            await run_db_call(approve_user, target_user_id)
             await query.edit_message_text(f"✅ User {target_user_id} approved.")
             try:
                 await context.bot.send_message(
@@ -2153,7 +2213,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         elif data.startswith("admin_reject_"):
             target_user_id = int(data.split("_")[2])
-            reject_user(target_user_id)
+            await run_db_call(reject_user, target_user_id)
             await query.edit_message_text(f"❌ User {target_user_id} rejected.")
             try:
                 await context.bot.send_message(
@@ -2165,7 +2225,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Check if user is approved
-    status = get_user_status(user_id)
+    status = await run_db_call(get_user_status, user_id)
     if status != 'approved':
         await query.edit_message_text("❌ Your access is pending approval.")
         return
@@ -2179,7 +2239,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             # Update user session with new count
-            update_user_session(user_id, number_count=count)
+            await run_db_call(update_user_session, user_id, number_count=count)
             
             await query.edit_message_text(
                 f"✅ Number count set to {count}.\n\n"
@@ -2625,8 +2685,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"❌ No ranges found for {country}.")
             return
         
-        range_id = selected_range.get('numerical_id', selected_range.get('range_id', selected_range.get('id', '')))
-        range_name = selected_range.get('pattern', selected_range.get('name', ''))
+        range_id = resolve_range_token(selected_range)
+        range_name = normalize_range_for_deeplink(selected_range.get('pattern', selected_range.get('name', '')))
+        if not range_name:
+            range_name = range_id
+        if not range_id:
+            await query.edit_message_text("❌ Invalid range. Please select again.")
+            return
         
         # Show loading message and acknowledge callback immediately
         await query.edit_message_text("⏳ Requesting numbers...")
@@ -2639,7 +2704,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async def fetch_and_send_numbers():
             try:
                 # Get user's number count preference
-                session = get_user_session(user_id)
+                session = await run_db_call(get_user_session, user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
                 # with api_lock:
@@ -2676,7 +2741,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 # Store all numbers in session (comma-separated)
                 numbers_str = ','.join(numbers_list)
-                update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
+                await run_db_call(update_user_session, user_id, service_name, country, range_id, numbers_str, 1)
                 
                 # Start monitoring all numbers in background
                 # First, cancel any existing job to reset 15-min timer
@@ -2955,8 +3020,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 row = []
                 range1 = filtered_ranges[i]
                 range_name1 = range1.get('pattern', range1.get('name', ''))
-                # Use range_id (which is now the pattern) as primary identifier
-                range_id1 = range1.get('range_id') or range1.get('numerical_id') or range_name1
+                # Use range pattern token as primary identifier (avoid internal numeric IDs).
+                range_id1 = resolve_range_token(range1) or range_name1
                 range_id_field1 = range1.get('numerical_id') or range1.get('range_id') or ''
                 actual_service = service_name # Use the service/app ID we are browsing
                 
@@ -2973,8 +3038,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if i + 1 < len(filtered_ranges):
                     range2 = filtered_ranges[i + 1]
                     range_name2 = range2.get('pattern', range2.get('name', ''))
-                    # Use range_id (which is now the pattern) as primary identifier
-                    range_id2 = range2.get('range_id') or range2.get('numerical_id') or range_name2
+                    # Use range pattern token as primary identifier (avoid internal numeric IDs).
+                    range_id2 = resolve_range_token(range2) or range_name2
                     range_id_field2 = range2.get('numerical_id') or range2.get('range_id') or ''
                     actual_service2 = service_name
                     
@@ -3218,7 +3283,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 
                 # Get user's number count preference
-                session = get_user_session(user_id)
+                session = await run_db_call(get_user_session, user_id)
                 number_count = session.get('number_count', 2) if session else 2
                 
                 # with api_lock:
@@ -3322,7 +3387,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 
                 # Store numbers and start monitoring
-                update_user_session(user_id, service=service_name, range_id=range_id, number=','.join(numbers_list), monitoring=1)
+                await run_db_call(update_user_session, user_id, service=service_name, range_id=range_id, number=','.join(numbers_list), monitoring=1)
                 
                 # Start OTP monitoring job
                 if user_id in user_jobs:
@@ -3368,29 +3433,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Range checker back to services
     elif data == "rangechkr_back_services":
-        keyboard = [
-            [InlineKeyboardButton("💬 WhatsApp", callback_data="rangechkr_service_whatsapp")],
-            [InlineKeyboardButton("👥 Facebook", callback_data="rangechkr_service_facebook")],
-            [InlineKeyboardButton("✈️ Telegram", callback_data="rangechkr_service_telegram")],
-            [InlineKeyboardButton("✨ Others", callback_data="rangechkr_service_others")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = build_service_menu_markup("rangechkr_service_")
         await query.edit_message_text(
-            "🗂️ Select service to view ranges:",
+            "🗂️ Range Center\nChoose a service to view active ranges:",
             reply_markup=reply_markup
         )
     
     # Back to services
     elif data == "back_services":
-        keyboard = [
-            [InlineKeyboardButton("💬 WhatsApp", callback_data="service_whatsapp")],
-            [InlineKeyboardButton("👥 Facebook", callback_data="service_facebook")],
-            [InlineKeyboardButton("✈️ Telegram", callback_data="service_telegram")],
-            [InlineKeyboardButton("✨ Others", callback_data="service_others")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        reply_markup = build_service_menu_markup("service_")
         await query.edit_message_text(
-            "🎯 Select a service:",
+            "🧭 Service Picker\nChoose where you want numbers from:",
             reply_markup=reply_markup
         )
 
@@ -3400,30 +3453,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     # Check if user is approved
-    status = get_user_status(user_id)
+    status = await run_db_call(get_user_status, user_id)
     if status != 'approved':
         await update.message.reply_text("❌ Your access is pending approval.")
         return
     
     # Handle "Get Number" button
-    if text in ("Get Number", "📲 Get Number"):
-        keyboard = [
-            [InlineKeyboardButton("💬 WhatsApp", callback_data="service_whatsapp")],
-            [InlineKeyboardButton("👥 Facebook", callback_data="service_facebook")],
-            [InlineKeyboardButton("✈️ Telegram", callback_data="service_telegram")],
-            [InlineKeyboardButton("✨ Others", callback_data="service_others")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+    if text in ("Get Number", "📲 Get Number", BTN_GET_NUMBER):
+        reply_markup = build_service_menu_markup("service_")
         await update.message.reply_text(
-            "🎯 Select a service:",
+            "🧭 Service Picker\nChoose where you want numbers from:",
             reply_markup=reply_markup
         )
         return
     
     # Handle "Set Number Count" button
-    if text in ("Set Number Count", "🧮 Set Number Count"):
+    if text in ("Set Number Count", "🧮 Set Number Count", BTN_SET_NUMBER_COUNT):
         # Get current count
-        session = get_user_session(user_id)
+        session = await run_db_call(get_user_session, user_id)
         current_count = session.get('number_count', 2) if session else 2
         
         keyboard = [
@@ -3435,26 +3482,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"📊 Set how many numbers you want to receive:\n\n"
-            f"Current setting: {current_count} numbers",
+            f"⚙️ Number Count Settings\n\n"
+            f"Select how many numbers you want per request.\n"
+            f"Current setting: {current_count} number(s)",
             reply_markup=reply_markup
         )
         return
     
     # Handle "My Stats" button
-    if text in ("My Stats", "📊 My Stats"):
+    if text in ("My Stats", "📊 My Stats", BTN_MY_STATS):
         today_count = get_today_otp_count(user_id)
         bd_now = get_bd_now()
         await update.message.reply_text(
-            "📊 My Stats\n\n"
+            "📈 Usage Dashboard\n\n"
             f"🕒 BD time now: {bd_now.strftime('%Y-%m-%d %I:%M:%S %p')}\n"
-            f"✅ Today you received: {today_count} OTP(s)."
+            f"✅ OTP received today: {today_count}"
         )
         return
     
     # Handle service selection (old format - for backward compatibility)
-    if text in ["💬 WhatsApp", "👥 Facebook", "✈️ Telegram"]:
+    if text in [
+        SERVICE_BTN_WHATSAPP, SERVICE_BTN_FACEBOOK, SERVICE_BTN_TELEGRAM,
+        "💬 WhatsApp", "👥 Facebook", "✈️ Telegram"
+    ]:
         service_map = {
+            SERVICE_BTN_WHATSAPP: "whatsapp",
+            SERVICE_BTN_FACEBOOK: "facebook",
+            SERVICE_BTN_TELEGRAM: "telegram",
             "💬 WhatsApp": "whatsapp",
             "👥 Facebook": "facebook",
             "✈️ Telegram": "telegram"
@@ -3559,7 +3613,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             # Get user's number count preference
-            session = get_user_session(user_id)
+            session = await run_db_call(get_user_session, user_id)
             number_count = session.get('number_count', 2) if session else 2
             
             # Try range_name first, then range_id (like otp_tool.py)
@@ -3640,7 +3694,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             # Store numbers and start monitoring
-            update_user_session(user_id, service=found_service, range_id=range_id, number=','.join(numbers_list), monitoring=1)
+            await run_db_call(update_user_session, user_id, service=found_service, range_id=range_id, number=','.join(numbers_list), monitoring=1)
             
             # Start OTP monitoring job
             if user_id in user_jobs:
@@ -3680,14 +3734,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle country selection (old format - for backward compatibility)
     elif any(text.startswith(f) for f in ["🇦🇴", "🇰🇲", "🇷🇴", "🇩🇰", "🇧🇩", "🇮🇳", "🇺🇸", "🇬🇧", "🌍"]) or "🔙" in text:
         if text == "🔙 Back":
-            keyboard = [
-                [KeyboardButton("📲 Get Number")],
-                [KeyboardButton("🧮 Set Number Count")],
-                [KeyboardButton("📊 My Stats")]
-            ]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+            reply_markup = build_main_menu_markup()
             await update.message.reply_text(
-                "✨ Ready when you are — tap 📲 Get Number to start:",
+                f"✨ Ready for the next run.\nTap {BTN_GET_NUMBER} to continue.",
                 reply_markup=reply_markup
             )
             return
@@ -3696,7 +3745,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         country = re.sub(r'^[🇦-🇿\s]+', '', text).strip()
         
         # Get service from user session
-        session = get_user_session(user_id)
+        session = await run_db_call(get_user_session, user_id)
         service_name = session.get('service') if session else None
         
         if not service_name:
@@ -3754,11 +3803,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"❌ No ranges found for {country}.")
                 return
             
-            range_id = selected_range.get('name', selected_range.get('id', ''))
-            range_name = selected_range.get('name', '')
+            range_id = resolve_range_token(selected_range)
+            range_name = normalize_range_for_deeplink(selected_range.get('name', '')) or range_id
+            if not range_id:
+                await update.message.reply_text("❌ Invalid range. Please select again.")
+                return
             
             # Get user's number count preference
-            session = get_user_session(user_id)
+            session = await run_db_call(get_user_session, user_id)
             number_count = session.get('number_count', 2) if session else 2
             
             # Request numbers
@@ -3789,17 +3841,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # Store all numbers in session (comma-separated)
             numbers_str = ','.join(numbers_list)
-            update_user_session(user_id, service_name, country, range_id, numbers_str, 1)
-            
-            # Start monitoring all numbers in background
-            job = context.job_queue.run_repeating(
-                monitor_otp,
-                interval=2,
-                first=2,
-                chat_id=user_id,
-                data={'numbers': numbers_list, 'user_id': user_id, 'country': country, 'service': service_name, 'start_time': time.time(), 'message_id': sent_msg.message_id}
-            )
-            user_jobs[user_id] = job
+            await run_db_call(update_user_session, user_id, service_name, country, range_id, numbers_str, 1)
             
             # Create inline keyboard with 5 numbers (click to copy supported via <code> tag)
             keyboard = []
@@ -3839,6 +3881,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=reply_markup,
                 parse_mode='HTML'
             )
+
+            # Start monitoring after message creation so message_id is valid.
+            job = context.job_queue.run_repeating(
+                monitor_otp,
+                interval=2,
+                first=2,
+                chat_id=user_id,
+                data={
+                    'numbers': numbers_list,
+                    'user_id': user_id,
+                    'country': country,
+                    'service': service_name,
+                    'range_id': range_id,
+                    'start_time': time.time(),
+                    'message_id': sent_msg.message_id
+                }
+            )
+            user_jobs[user_id] = job
         except Exception as e:
             logger.error(f"Error in handle_message country selection: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
@@ -3873,7 +3933,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
         job.schedule_removal()
         if user_id in user_jobs:
             del user_jobs[user_id]
-        update_user_session(user_id, monitoring=0)
+        await run_db_call(update_user_session, user_id, monitoring=0)
         try:
             # Keep the same numbers visible and mark unresolved numbers as expired.
             service_name = str(job_data.get('service') or 'Unknown')
@@ -4031,10 +4091,10 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                     job_data['received_otps'] = received_otps  # Update job data
                     
                     # Record this number as used (no reuse for 24 hours)
-                    add_used_number(number)
+                    await run_db_call(add_used_number, number)
                     
                     # Get country and service info from job data (most reliable) or session
-                    session = get_user_session(user_id)
+                    session = await run_db_call(get_user_session, user_id)
                     
                     # Try to get country from job data first (most reliable), then session
                     country = job_data.get('country') if job_data else None
@@ -4085,6 +4145,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         range_for_button = job_data.get('range_id')
                     if not range_for_button and session:
                         range_for_button = session.get('range_id')
+                    range_for_button = normalize_range_for_deeplink(range_for_button, fallback_number=number)
                     if not range_for_button:
                         range_for_button = infer_range_from_number(number)
                     if range_for_button and job_data and not job_data.get('range_id'):
@@ -4136,7 +4197,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         logger.warning(f"⚠️ OTP sent to channel but NOT to user {user_id} for {number}: {otp}")
                     
                     # Increment per-day OTP counter (BD time)
-                    increment_otp_count(user_id)
+                    await run_db_call(increment_otp_count, user_id)
 
                     # Check if all numbers have received OTP
                     all_received = all(num in received_otps for num in numbers)
@@ -4146,7 +4207,7 @@ async def monitor_otp(context: ContextTypes.DEFAULT_TYPE):
                         job.schedule_removal()
                         if user_id in user_jobs:
                             del user_jobs[user_id]
-                        update_user_session(user_id, monitoring=0)
+                        await run_db_call(update_user_session, user_id, monitoring=0)
                         return
                     # Otherwise, continue monitoring for remaining numbers
     except Exception as e:
